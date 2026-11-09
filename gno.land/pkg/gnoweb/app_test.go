@@ -1,0 +1,469 @@
+package gnoweb
+
+import (
+	"fmt"
+	"html"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"regexp"
+	"sync"
+	"testing"
+
+	"github.com/rs/xid"
+
+	"github.com/gnolang/gno/gno.land/pkg/gnoweb/feature/chainmap"
+	"github.com/gnolang/gno/gno.land/pkg/gnoweb/indexer"
+	"github.com/gnolang/gno/gno.land/pkg/integration"
+	"github.com/gnolang/gno/gnovm/pkg/gnoenv"
+	"github.com/gnolang/gno/tm2/pkg/bft/node"
+	"github.com/gnolang/gno/tm2/pkg/log"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	ok         = http.StatusOK
+	found      = http.StatusFound
+	notFound   = http.StatusNotFound
+	badRequest = http.StatusBadRequest
+)
+
+// Booting an in-memory node loads and runs every example package from genesis
+// — by far the dominant cost of this package's tests. The gnoweb tests only
+// query the node (read-only GETs), so a single node is shared across them all
+// instead of booting one per test. It is created lazily so mock-based tests
+// (handler/renderer) that never touch a node don't pay the boot cost, and
+// torn down in TestMain.
+var (
+	sharedNodeOnce sync.Once
+	sharedNode     *node.Node
+	sharedNodeAddr string
+)
+
+func sharedNodeRemote(t *testing.T) string {
+	t.Helper()
+	sharedNodeOnce.Do(func() {
+		rootdir := gnoenv.RootDir()
+		genesis := integration.LoadDefaultGenesisTXsFile(t, "tendermint_test", rootdir)
+		config, _ := integration.TestingNodeConfig(t, rootdir, genesis...)
+		sharedNode, sharedNodeAddr = integration.TestingInMemoryNode(t, log.NewNoopLogger(), config)
+	})
+	// If the boot above failed, only the test that ran the Once fails; bail
+	// out here so later tests don't run against an empty remote.
+	require.NotEmpty(t, sharedNodeAddr, "shared in-memory node failed to boot")
+	return sharedNodeAddr
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if sharedNode != nil {
+		_ = sharedNode.Stop()
+	}
+	os.Exit(code)
+}
+
+func TestRoutes(t *testing.T) {
+	var (
+		uuid1   = xid.New()
+		uuid2   = xid.New()
+		aliases = map[string]AliasTarget{
+			"/test1": {Value: "/r/sys/users", Kind: GnowebPath},
+			"/test2": {Value: uuid1.String(), Kind: StaticMarkdown},
+			"/test3": {Value: "/r/not/found", Kind: GnowebPath},
+			"/test4": {Value: uuid2.String(), Kind: StaticMarkdown},
+		}
+		routes = []struct {
+			route     string
+			status    int
+			substring string
+		}{
+			{"/", ok, "Welcome"}, // Check if / returns 200 (OK) and contains "Welcome".
+			{"/about", ok, "blockchain"},
+			{"/r/gnoland/blog", ok, ""}, // Any content
+			{"/r/gnoland/blog$help", ok, "AdminSetAdminAddr"},
+			{"/r/gnoland/blog/", ok, "admin.gno"},
+			{"/r/gnoland/blog/admin.gno", ok, ">func<"},
+			// Overview view: $source with no file should render the package overview.
+			{"/r/gnoland/blog$source", ok, "Package Index"},
+			{"/r/gnoland/blog$source", ok, "Source Files"},
+			// Source view: $source with a file should still render the classic code view.
+			{"/r/gnoland/blog$source&file=admin.gno", ok, "b-source-code"},
+			{"/r/gnoland/blog$help&func=Render", ok, "Render(path)"},
+			{"/r/gnoland/blog$help&func=Render&path=foo/bar", ok, `value="foo/bar"`},
+			// {"/r/gnoland/blog$help&func=NonExisting", ok, "NonExisting not found"}, // XXX(TODO)
+			{"/r/sys/users", ok, "r/sys/users"},
+			// Registered in the genesis txs, so these run the real vm/qeval
+			// query; zoo_ma123 also covers a name with a separator.
+			{"/u/moul001", ok, "moul001"},
+			{"/u/zoo_ma123", ok, "zoo_ma123"},
+			{"/u/zzznotauser", notFound, "user not found"},
+			{"/r/sys/users/users.gno", ok, "ResolveName"},
+			{"/r/tests/vm/deep/very/deep", ok, "it works!"},
+			{"/r/tests/vm/deep/very/deep?arg1=val1&arg2=val2", ok, "hi ?arg1=val1&amp;arg2=val2"},
+			{"/r/tests/vm/deep/very/deep:bob", ok, "hi bob"},
+			{"/r/tests/vm/deep/very/deep:bob?arg1=val1&arg2=val2", ok, "hi bob?arg1=val1&amp;arg2=val2"},
+			{"/r/tests/vm/deep/very/deep$help", ok, "Render"},
+			{"/r/tests/vm/deep/very/deep/", ok, "render.gno"},
+			{"/r/tests/vm/deep/very/deep/render.gno", ok, ">package<"},
+			{"/contribute", ok, "Game of Realms"},
+			{"/game-of-realms", found, "/contribute"},
+			{"/gor", found, "/contribute"},
+			{"/blog", found, "/r/gnoland/blog"},
+			{"/r/docs/optional_render", http.StatusOK, "gnomod.toml"},
+			{"/r/not/found/", notFound, ""},
+			{"/z/bad/request", badRequest, ""}, // not realm or pure
+			{"/아스키문자가아닌경로", notFound, ""},
+			{"/%ED%85%8C%EC%8A%A4%ED%8A%B8", notFound, ""},
+			{"/グノー", notFound, ""},
+			{"/\u269B\uFE0F", notFound, ""}, // Unicode
+			{"/p/demo/flow/LICENSE", ok, "BSD 3-Clause"},
+			// A file name must not resolve to another package path in vm/qfile.
+			{"/r/tests/vm/deep/very/deep$source&file=..%2F..%2F..%2F..%2F..%2Fsys%2Fusers%2Fusers.gno", notFound, ""},
+			{"/r/tests/vm/deep/very/deep$download&file=..%2F..%2F..%2F..%2F..%2Fsys%2Fusers%2Fusers.gno", notFound, ""},
+			{"/r/sys/users/init/%2E%2E", notFound, ""},
+			{"/r/sys/users$source&file=init", notFound, ""}, // no extension: qfile reads it as the child package
+			{"/r/sys/users$download&file=init", notFound, ""},
+			{"/r/sys/users$source&file=%20", notFound, ""}, // blank name trims to empty
+			{"/r/sys/users$download&file=%20", notFound, ""},
+			{"/r/sys/users$state&frag=source&file=init%2Finit.gno&line=1", ok, "file not found"}, // fragments answer 200 with an error body
+			// Test assets
+			{"/public/main.css", ok, ""},
+			{"/public/js/index.js", ok, ""},
+			{"/public/_chroma/style.css", ok, ""},
+			{"/public/imgs/gnoland.svg", ok, ""},
+			// Test special endpoints
+			{"/liveness", ok, `{"status":"ok"}`},
+			{"/ready", ok, `{"status":"ready"}`},
+			{"/search.json", ok, `realms`}, // realm/package discovery list (JSON key always present)
+			// Test Toc
+			{"/", ok, `href="#learn-about-gnoland"`},
+			// Test aliased path and static file
+			{"/test1", ok, "r/sys/users"},  // Alias "/test1" points to "/r/sys/users"
+			{"/test2", ok, uuid1.String()}, // Alias "/test2" points to static file containing an uuid
+			{"/test3", notFound, ""},       // Alias "/test3" points to "/r/not/found" which doesn't exist
+			{"/test4", ok, uuid2.String()}, // Alias "/test2_b" points to another static file containing an uuid
+			{"/test123", badRequest, ""},   // Alias "/test123" doesn't exist, points to "" which is not valid
+		}
+	)
+
+	// Use the shared in-memory node (see TestMain).
+	logger := log.NewTestingLogger(t)
+	remoteAddr := sharedNodeRemote(t)
+
+	// Initialize the router with the current node's remote address
+	cfg := NewDefaultAppConfig()
+	cfg.NodeRemote = remoteAddr
+	maps.Copy(cfg.Aliases, aliases)
+
+	router, err := NewRouter(logger, cfg)
+	require.NoError(t, err)
+
+	for _, r := range routes {
+		t.Run(fmt.Sprintf("test route %s", r.route), func(t *testing.T) {
+			t.Logf("input: %q", r.route)
+			request := httptest.NewRequest(http.MethodGet, r.route, nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assert.Equal(t, r.status, response.Code)
+			assert.Contains(t, response.Body.String(), r.substring)
+		})
+	}
+}
+
+func TestStaticMarkdownDevLinks(t *testing.T) {
+	t.Parallel()
+
+	logger := log.NewTestingLogger(t)
+	remoteAddr := sharedNodeRemote(t)
+
+	cfg := NewDefaultAppConfig()
+	cfg.NodeRemote = remoteAddr
+	cfg.Aliases["/"] = AliasTarget{Value: "# Home Static", Kind: StaticMarkdown}
+	cfg.Aliases["/staticmd"] = AliasTarget{Value: "# Static Content", Kind: StaticMarkdown}
+
+	router, err := NewRouter(logger, cfg)
+	require.NoError(t, err)
+
+	cases := []struct {
+		name  string
+		route string
+	}{
+		{"homepage static markdown", "/"},
+		{"non-homepage static markdown", "/staticmd"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			request := httptest.NewRequest(http.MethodGet, tc.route, nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			body := response.Body.String()
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Contains(t, body, `link-label">Content<`, "static markdown pages should have Content link")
+			assert.NotContains(t, body, `link-label">Source<`, "static markdown pages should not have Source link")
+			assert.NotContains(t, body, `link-label">Actions<`, "static markdown pages should not have Actions link")
+		})
+	}
+}
+
+func TestAnalytics(t *testing.T) {
+	routes := []string{
+		// Special realms
+		"/", // Home
+		"/about",
+		"/start",
+
+		// Redirects
+		"/game-of-realms",
+		"/getting-started",
+		"/blog",
+		"/boards",
+
+		// Realm, source, help page
+		"/r/gnoland/blog",
+		"/r/gnoland/blog/admin.gno",
+		"/r/sys/users",
+		"/r/gnoland/blog$help",
+
+		// Special pages
+		"/404-not-found",
+	}
+
+	remoteAddr := sharedNodeRemote(t)
+
+	t.Run("enabled", func(t *testing.T) {
+		for _, route := range routes {
+			t.Run(route, func(t *testing.T) {
+				cfg := NewDefaultAppConfig()
+				cfg.NodeRemote = remoteAddr
+				cfg.Analytics = true
+				logger := log.NewTestingLogger(t)
+
+				router, err := NewRouter(logger, cfg)
+				require.NoError(t, err)
+
+				request := httptest.NewRequest(http.MethodGet, route, nil)
+				response := httptest.NewRecorder()
+
+				router.ServeHTTP(response, request)
+
+				body := response.Body.String()
+				assert.Contains(t, body, "sa.gno.services")
+				assert.Contains(t, body, "js/analytics.js")
+				assert.Contains(t, body, "js/sa-bootstrap.js")
+				assert.Contains(t, body, "auto-events.js")
+				assert.Regexp(t, `data-page-type="[a-z]+"`, body, "page_type must populate with a non-empty enum value")
+			})
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		for _, route := range routes {
+			t.Run(route, func(t *testing.T) {
+				cfg := NewDefaultAppConfig()
+				cfg.NodeRemote = remoteAddr
+				cfg.Analytics = false
+				logger := log.NewTestingLogger(t)
+				router, err := NewRouter(logger, cfg)
+				require.NoError(t, err)
+
+				request := httptest.NewRequest(http.MethodGet, route, nil)
+				response := httptest.NewRecorder()
+
+				router.ServeHTTP(response, request)
+
+				assert.NotContains(t, response.Body.String(), "sa.gno.services")
+			})
+		}
+	})
+
+	t.Run("page_type", func(t *testing.T) {
+		// Verifies ClassifyPageType's output reaches the sa-bootstrap data-page-type
+		// attribute (which seeds window.sa_metadata client-side) for representative
+		// routes.
+		expected := map[string]string{
+			"/":                         "home",
+			"/r/gnoland/blog":           "realm",
+			"/r/gnoland/blog$help":      "help",
+			"/r/gnoland/blog/admin.gno": "source",
+			"/r/sys/users":              "realm",
+		}
+
+		cfg := NewDefaultAppConfig()
+		cfg.NodeRemote = remoteAddr
+		cfg.Analytics = true
+		logger := log.NewTestingLogger(t)
+		router, err := NewRouter(logger, cfg)
+		require.NoError(t, err)
+
+		for route, pageType := range expected {
+			t.Run(route, func(t *testing.T) {
+				request := httptest.NewRequest(http.MethodGet, route, nil)
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+
+				body := response.Body.String()
+				want := fmt.Sprintf(`data-page-type="%s"`, pageType)
+				assert.Contains(t, body, want, "route %q should emit %s", route, want)
+			})
+		}
+	})
+
+	t.Run("path_overwriter_sanitizes_args", func(t *testing.T) {
+		// The SimpleAnalytics path-overwriter reports a sanitized path so
+		// user-supplied function arguments in the URL never reach SA.
+		cfg := NewDefaultAppConfig()
+		cfg.NodeRemote = remoteAddr
+		cfg.Analytics = true
+		logger := log.NewTestingLogger(t)
+		router, err := NewRouter(logger, cfg)
+		require.NoError(t, err)
+
+		request := httptest.NewRequest(http.MethodGet, "/r/gnoland/blog$help&func=Render&body=topsecret", nil)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		body := response.Body.String()
+		assert.Contains(t, body, `data-path-overwriter="gnoSaPath"`, "latest.js must register the path-overwriter")
+
+		m := regexp.MustCompile(`data-sa-path="([^"]*)"`).FindStringSubmatch(body)
+		require.NotNil(t, m, "data-sa-path attribute must be present")
+		saPath := html.UnescapeString(m[1])
+		assert.Contains(t, saPath, "func=Render", "exported func name should be preserved")
+		assert.Contains(t, saPath, "body=redacted", "user argument value should be masked")
+		assert.NotContains(t, saPath, "topsecret", "raw user argument value must not leak to analytics")
+	})
+}
+
+func TestHealthEndpoints(t *testing.T) {
+	logger := log.NewTestingLogger(t)
+
+	t.Run("not healthy", func(t *testing.T) {
+		// Initialize the router with invalid address
+		cfg := NewDefaultAppConfig()
+		cfg.NodeRemote = "127.0.0.1:123456" // invalid port
+		cfg.ChainID = "test"
+		router, err := NewRouter(logger, cfg)
+		require.NoError(t, err)
+
+		t.Run("service should be running", func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/liveness", nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Equal(t, "application/json", response.Header().Get("Content-Type"))
+			assert.Contains(t, response.Body.String(), `{"status":"ok"}`)
+		})
+
+		t.Run("node should not be accessible", func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/ready", nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+		})
+	})
+
+	t.Run("healthy", func(t *testing.T) {
+		// Use the shared in-memory node (see TestMain).
+		remoteAddr := sharedNodeRemote(t)
+
+		// Initialize the router with the current node's remote address
+		cfg := NewDefaultAppConfig()
+		cfg.NodeRemote = remoteAddr
+		router, err := NewRouter(logger, cfg)
+		require.NoError(t, err)
+
+		t.Run("service should be running", func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/liveness", nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Equal(t, "application/json", response.Header().Get("Content-Type"))
+			assert.Contains(t, response.Body.String(), `{"status":"ok"}`)
+		})
+
+		t.Run("node should be accessible", func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/ready", nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Equal(t, "application/json", response.Header().Get("Content-Type"))
+			assert.Contains(t, response.Body.String(), `{"status":"ready"}`)
+		})
+	})
+}
+
+// The binaries (cmd/gnoweb, gnodev) start from NewDefaultAppConfig, so its
+// rate is the one production runs. Behind a proxy without -trusted-proxies
+// every visitor shares a bucket, and omnibar typeahead must not hit 429 at
+// the old 100/min.
+func TestDefaultConfigSearchRateLimit(t *testing.T) {
+	cfg := NewDefaultAppConfig()
+	cfg.NodeRemote = sharedNodeRemote(t)
+	router, err := NewRouter(log.NewTestingLogger(t), cfg)
+	require.NoError(t, err)
+
+	for i := range 150 {
+		request := httptest.NewRequest(http.MethodGet, "/$search?q=blog&json", nil)
+		request.RemoteAddr = "192.0.2.1:1234"
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		require.NotEqual(t, http.StatusTooManyRequests, response.Code,
+			"request %d from one IP was rate-limited under the default config", i+1)
+	}
+}
+
+// A URL the client could never reach fails at startup, not behind a log line
+// calling the indexer enabled.
+func TestNewRouterRejectsInvalidIndexerURL(t *testing.T) {
+	for _, raw := range []string{"localhost:8546/graphql", "ftp://indexer.example/q", "http:///graphql"} {
+		cfg := NewDefaultAppConfig()
+		cfg.NodeRemote = sharedNodeRemote(t)
+		cfg.IndexerURL = raw
+		_, err := NewRouter(log.NewTestingLogger(t), cfg)
+		require.Error(t, err, raw)
+	}
+}
+
+// TestNewDefaultAppConfigCopiesAliases checks a config's aliases are its own:
+// adding one must not reach DefaultAliases, which other configs read.
+func TestNewDefaultAppConfigCopiesAliases(t *testing.T) {
+	t.Parallel()
+
+	cfg := NewDefaultAppConfig()
+	cfg.Aliases["/only-mine"] = AliasTarget{Value: "# Mine", Kind: StaticMarkdown}
+	assert.NotContains(t, DefaultAliases, "/only-mine")
+}
+
+// TestNewDefaultAppConfigIndexesNoCommunity checks community pages stay out of
+// search unless an operator opts in: a name costs nothing to register, so
+// indexing pages under one would publish scams under gno.land.
+func TestNewDefaultAppConfigIndexesNoCommunity(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, IndexNoCommunity, NewDefaultAppConfig().IndexCommunity)
+}
+
+// With an indexer, importer lookups get their own narrow bucket: the general
+// rate would let one address start hundreds of whole-chain scans a minute.
+func TestChainmapDepsLimitsLookups(t *testing.T) {
+	t.Parallel()
+
+	cfg := &HTTPHandlerConfig{Indexer: indexer.New("http://indexer.invalid/graphql/query", "")}
+	deps := chainmapDeps(cfg, log.NewTestingLogger(t), nil)
+	require.NotNil(t, deps.Limiter)
+	r := httptest.NewRequest(http.MethodGet, "/p/demo/lib$deps", nil)
+	for range chainmap.LookupsBurst {
+		require.True(t, deps.Limiter.AllowRequest(r))
+	}
+	assert.False(t, deps.Limiter.AllowRequest(r), "past the burst a lookup must be refused")
+}

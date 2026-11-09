@@ -1,0 +1,64 @@
+package main
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+
+	"github.com/gnolang/gno/gno.land/pkg/gnoweb"
+)
+
+// setupGnoWebServer initializes the gnoweb HTTP handler from the gnodev
+// AppConfig, returning a 404 handler when gnoweb is disabled.
+func setupGnoWebServer(logger *slog.Logger, cfg *AppConfig, remoteAddr string) (http.Handler, error) {
+	if cfg.noWeb {
+		return http.HandlerFunc(http.NotFound), nil
+	}
+
+	appcfg := gnoWebAppConfig(cfg, remoteAddr)
+
+	router, err := gnoweb.NewRouter(logger, appcfg)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create router app: %w", err)
+	}
+
+	logger.Debug("gnoweb router created",
+		"remote", appcfg.NodeRemote,
+		"helper_remote", appcfg.RemoteHelp,
+		"html", appcfg.UnsafeHTML,
+		"analytics", appcfg.Analytics,
+		"ipfs_gateway", appcfg.RenderConfig.IPFSGateway,
+		"chain_id", cfg.chainId,
+	)
+	return router, nil
+}
+
+// gnoWebAppConfig maps the gnodev AppConfig onto gnoweb's.
+func gnoWebAppConfig(cfg *AppConfig, remoteAddr string) *gnoweb.AppConfig {
+	appcfg := gnoweb.NewDefaultAppConfig()
+	appcfg.UnsafeHTML = cfg.webHTML
+	appcfg.Analytics = cfg.webAnalytics
+	appcfg.AnalyticsHostname = cfg.webAnalyticsHostname
+	appcfg.RenderConfig.IPFSGateway = cfg.webIPFSGateway
+	appcfg.NodeRemote = remoteAddr
+	appcfg.ChainID = cfg.chainId
+	// A dev or staging chain is never the canonical site.
+	appcfg.NoIndex = true
+	// Every package on a local gnodev chain is the developer's own. A
+	// staging server hosts other deployers' realms on a chain that reserves
+	// no namespace (gnodev never enables r/sys/names), so it trusts and indexes
+	// none of them.
+	if cfg.staging {
+		appcfg.TrustedPaths = nil
+		appcfg.IndexCommunity = gnoweb.IndexNoCommunity
+	} else {
+		appcfg.TrustedPaths = []string{"*"}
+	}
+	if cfg.webRemoteHelperAddr != "" {
+		appcfg.RemoteHelp = cfg.webRemoteHelperAddr
+	} else {
+		appcfg.RemoteHelp = remoteAddr
+	}
+
+	return appcfg
+}

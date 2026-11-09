@@ -1,0 +1,292 @@
+package http
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+
+	types "github.com/gnolang/gno/tm2/pkg/bft/rpc/lib/types"
+)
+
+const (
+	protoHTTP  = "http"
+	protoHTTPS = "https"
+	protoTCP   = "tcp"
+	protoUnix  = "unix"
+
+	portHTTP  = "80"
+	portHTTPS = "443"
+)
+
+var (
+	ErrRequestResponseIDMismatch = errors.New("http request / response ID mismatch")
+	ErrInvalidBatchResponse      = errors.New("invalid http batch response size")
+)
+
+// Client is an HTTP client implementation
+type Client struct {
+	rpcURL string // the remote RPC URL of the node
+
+	client *http.Client
+}
+
+// NewClient initializes and creates a new HTTP RPC client
+func NewClient(rpcURL string) (*Client, error) {
+	// Parse the RPC URL
+	address, err := toClientAddress(rpcURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid RPC URL, %w", err)
+	}
+
+	c := &Client{
+		rpcURL: address,
+		client: defaultHTTPClient(rpcURL),
+	}
+
+	return c, nil
+}
+
+// SendRequest sends a single RPC request to the server
+func (c *Client) SendRequest(ctx context.Context, request types.RPCRequest) (*types.RPCResponse, error) {
+	// Send the request
+	response, err := sendRequestCommon[types.RPCRequest, *types.RPCResponse](ctx, c.client, c.rpcURL, request)
+	if err != nil {
+		return nil, err
+	}
+
+	// Make sure the ID matches
+	if request.ID != response.ID {
+		if (response.ID == nil || response.ID.String() == "") && response.Error != nil {
+			return nil, response.Error
+		}
+		return nil, ErrRequestResponseIDMismatch
+	}
+
+	return response, nil
+}
+
+// SendBatch sends a single RPC batch request to the server
+func (c *Client) SendBatch(ctx context.Context, requests types.RPCRequests) (types.RPCResponses, error) {
+	// Send the batch
+	responses, err := sendRequestCommon[types.RPCRequests, types.RPCResponses](ctx, c.client, c.rpcURL, requests)
+	if err != nil {
+		return nil, err
+	}
+
+	// Make sure the length matches
+	if len(responses) != len(requests) {
+		return nil, ErrInvalidBatchResponse
+	}
+
+	// Make sure the IDs match
+	for index, response := range responses {
+		if requests[index].ID != response.ID {
+			if (response.ID == nil || response.ID.String() == "") && response.Error != nil {
+				return nil, response.Error
+			}
+			return nil, ErrRequestResponseIDMismatch
+		}
+	}
+
+	return responses, nil
+}
+
+// Close has no effect on an HTTP client
+func (c *Client) Close() error {
+	return nil
+}
+
+type (
+	requestType interface {
+		types.RPCRequest | types.RPCRequests
+	}
+
+	responseType interface {
+		*types.RPCResponse | types.RPCResponses
+	}
+)
+
+// sendRequestCommon executes the common request sending
+func sendRequestCommon[T requestType, R responseType](
+	ctx context.Context,
+	client *http.Client,
+	rpcURL string,
+	request T,
+) (R, error) {
+	// Marshal the request
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("unable to JSON-marshal the request, %w", err)
+	}
+
+	// Craft the request
+	req, err := http.NewRequest(
+		http.MethodPost,
+		rpcURL,
+		bytes.NewBuffer(requestBytes),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create request, %w", err)
+	}
+
+	// Set the header content type
+	req.Header.Set("Content-Type", "application/json")
+
+	// Execute the request
+	httpResponse, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("unable to send request, %w", err)
+	}
+	defer httpResponse.Body.Close() //nolint: errcheck
+
+	// Parse the response code
+	if !isOKStatus(httpResponse.StatusCode) {
+		return nil, fmt.Errorf("invalid status code received, %d", httpResponse.StatusCode)
+	}
+
+	// Parse the response body
+	responseBytes, err := io.ReadAll(httpResponse.Body)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read response body, %w", err)
+	}
+
+	var response R
+
+	if err := json.Unmarshal(responseBytes, &response); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal response body, %w", err)
+	}
+
+	return response, nil
+}
+
+// DefaultHTTPClient is used to create an http client with some default parameters.
+// We overwrite the http.Client.Dial so we can do http over tcp or unix.
+// remoteAddr should be fully featured (eg. with tcp:// or unix://)
+func defaultHTTPClient(remoteAddr string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			// Set to true to prevent GZIP-bomb DoS attacks
+			DisableCompression: true,
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return makeHTTPDialer(remoteAddr)
+			},
+		},
+	}
+}
+
+func makeHTTPDialer(remoteAddr string) (net.Conn, error) {
+	protocol, address := parseRemoteAddr(remoteAddr)
+
+	// net.Dial doesn't understand http/https, so change it to TCP
+	switch protocol {
+	case protoHTTP, protoHTTPS:
+		protocol = protoTCP
+	}
+
+	// A URL path is part of the request, not of the dial target: net.Dial on
+	// "127.0.0.1:26657/rpc" reads "/rpc" as the port and fails. Unix keeps its
+	// path, which is the socket itself. tcp4 and tcp6 are tcp too.
+	if strings.HasPrefix(protocol, protoTCP) {
+		if host, _, found := strings.Cut(address, "/"); found {
+			address = host
+		}
+	}
+
+	return net.Dial(protocol, address)
+}
+
+// protocol - client's protocol (for example, "http", "https", "wss", "ws", "tcp")
+// trimmedS - rest of the address (for example, "192.0.2.1:25", "[2001:db8::1]:80") with "/" replaced with "."
+func toClientAddrAndParse(remoteAddr string) (string, string) {
+	protocol, address := parseRemoteAddr(remoteAddr)
+
+	// protocol to use for http operations, to support both http and https
+	var clientProtocol string
+	// default to http for unknown protocols (ex. tcp)
+	switch protocol {
+	case protoHTTP, protoHTTPS:
+		clientProtocol = protocol
+	default:
+		clientProtocol = protoHTTP
+	}
+
+	// A unix socket's address is a filesystem path, so "/" is encoded as "."
+	// to give the request URL a host. makeHTTPDialer ignores that host and
+	// dials the socket from the raw remote.
+	//
+	// Only for unix sockets (unix and unixpacket, both accepted by the
+	// server's Listen). Doing it to a tcp/http address destroys any URL
+	// path, so an RPC published behind a prefix ("https://host/rpc", the usual
+	// way to serve a chain and its web UI on one hostname) turned into
+	// "https://host.rpc" and failed to parse.
+	if strings.HasPrefix(protocol, protoUnix) {
+		address = strings.ReplaceAll(address, "/", ".")
+	}
+
+	return clientProtocol, address
+}
+
+func toClientAddress(remoteAddr string) (string, error) {
+	// Only a unix socket may have no host: a scheme-less "/var/run/gno.sock"
+	// or "http:///rpc" would otherwise be sent to whatever listens locally.
+	protocol, address := parseRemoteAddr(remoteAddr)
+	if host, _, _ := strings.Cut(address, "/"); host == "" && !strings.HasPrefix(protocol, protoUnix) {
+		return "", fmt.Errorf("no host in %q", remoteAddr)
+	}
+
+	clientProtocol, trimmedAddress := toClientAddrAndParse(remoteAddr)
+
+	return clientProtocol + "://" + trimmedAddress, nil
+}
+
+// network - name of the network (for example, "tcp", "unix")
+// s - rest of the address (for example, "192.0.2.1:25", "[2001:db8::1]:80")
+// TODO: Deprecate support for IP:PORT or /path/to/socket
+func parseRemoteAddr(remoteAddr string) (string, string) {
+	parts := strings.SplitN(remoteAddr, "://", 2)
+
+	var protocol, address string
+	switch len(parts) {
+	case 1:
+		// default to tcp if nothing specified
+		protocol, address = protoTCP, remoteAddr
+	case 2:
+		protocol, address = parts[0], parts[1]
+	}
+
+	// Append default ports if not specified. Split the path off first: the
+	// port belongs to the host, and appending it to the whole string turned
+	// "https://host/rpc" into "https://host/rpc:443".
+	//
+	// Unix sockets are excluded because their address is a path, not a host.
+	// An empty host gets no port either, so toClientAddress can reject it
+	// instead of it becoming ":80", which is localhost.
+	if !strings.HasPrefix(protocol, protoUnix) {
+		host, path, hasPath := strings.Cut(address, "/")
+		if host != "" && !strings.Contains(host, ":") {
+			switch protocol {
+			case protoHTTPS:
+				host += ":" + portHTTPS
+			case protoHTTP, protoTCP:
+				host += ":" + portHTTP
+			default: // noop
+			}
+		}
+		address = host
+		if hasPath {
+			address += "/" + path
+		}
+	}
+
+	return protocol, address
+}
+
+// isOKStatus returns a boolean indicating if the response
+// status code is between 200 and 299 (inclusive)
+func isOKStatus(code int) bool { return code >= 200 && code <= 299 }

@@ -1,0 +1,91 @@
+.PHONY: help
+help:
+	@echo "Available make commands:"
+	@cat Makefile | grep '^[a-z][^:]*:' | cut -d: -f1 | sort | sed 's/^/  /'
+
+# command to run dependency utilities, like goimports.
+rundep=go run -modfile ../misc/devdeps/go.mod
+
+########################################
+# Environment variables
+# You can overwrite any of the following by passing a different value on the
+# command line, ie. `CGO_ENABLED=1 make test`.
+
+# disable cgo by default. cgo requires some additional dependencies in some
+# cases, and is not strictly required by any tm2 code.
+CGO_ENABLED ?= 0
+export CGO_ENABLED
+# flags for `make fmt`. -w will write the result to the destination files.
+GOFMT_FLAGS ?= -w
+# flags for `make imports`.
+GOIMPORTS_FLAGS ?= $(GOFMT_FLAGS)
+# test suite flags.
+GOTEST_FLAGS ?= -v -p 1 -timeout=30m
+# `gno test` worker count. Each worker holds a full GnoVM store, so leaving this
+# at the default (GOMAXPROCS) makes peak memory track the host's core count:
+# ~8 GiB over sixteen workers against ~4 GiB over four, for the same wall time —
+# this suite is bound by memory, not CPU. 4 as in testutils.MaxParallel, and
+# overridable by GNO_TEST_MAX_PARALLEL as there, which likewise ignores anything
+# but a positive integer; `gno test` itself lowers -p to GOMAXPROCS on smaller
+# machines.
+GNOTEST_JOBS ?= $(or $(shell echo '$(GNO_TEST_MAX_PARALLEL)' | grep -xE '\+?0*[1-9][0-9]{0,17}' | sed 's/^+//; s/^0*//'),4)
+
+########################################
+# Dev tools
+.PHONY: transpile
+transpile:
+	go run ../gnovm/cmd/gno tool transpile -v .
+
+.PHONY: build
+build:
+	go run ../gnovm/cmd/gno tool transpile -v --gobuild .
+
+.PHONY: test
+test:
+	go run ../gnovm/cmd/gno test -v -p $(GNOTEST_JOBS) ./... 2>&1 | tee /dev/stderr | grep -E '^(FAIL|--- FAIL)|\(type: \*[a-zA-Z._]*[Ee]rror' > /tmp/gno-test-failures; \
+	if [ -s /tmp/gno-test-failures ]; then \
+		echo ""; \
+		echo "========================================"; \
+		echo "FAILED TESTS / BUILD ERRORS:"; \
+		echo "========================================"; \
+		cat /tmp/gno-test-failures; \
+		exit 1; \
+	fi
+
+.PHONY: test.fast
+test.fast:
+	go run ../gnovm/cmd/gno test -failfast -v -p $(GNOTEST_JOBS) ./...
+
+.PHONY: lint
+lint:
+	go run ../gnovm/cmd/gno lint -v ./...
+
+.PHONY: fix
+fix:
+	go run ../gnovm/cmd/gno fix -v .
+
+.PHONY: test.sync
+test.sync:
+	go run ../gnovm/cmd/gno test -v -p $(GNOTEST_JOBS) --update-golden-tests ./...
+
+.PHONY: clean
+clean:
+	find . \( -name "*.gno.gen.go" -or -name ".*.gno.gen_test.go" \) -delete
+
+.PHONY: fmt
+GNOFMT_FLAGS ?= -w
+fmt:
+	go run ../gnovm/cmd/gno fmt $(GNOFMT_FLAGS) ./...
+
+.PHONY: tidy
+tidy:
+	go run github.com/gnolang/gno/gnovm/cmd/gno mod tidy -v --recursive
+
+.PHONY: generate
+generate:
+	go generate ./...
+	$(MAKE) fmt
+
+.PHONY: embed_markdown
+embed_markdown:
+	$(rundep) github.com/campoy/embedmd -w `find . -name "*.md"`

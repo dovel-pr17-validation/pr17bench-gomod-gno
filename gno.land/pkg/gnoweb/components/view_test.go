@@ -1,0 +1,512 @@
+package components
+
+import (
+	"io"
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/gnolang/gno/gnovm/pkg/doc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSourceView(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     SourceData
+		expected int
+	}{
+		{
+			name: "Basic Test",
+			data: SourceData{
+				PkgPath:      "example/path",
+				Files:        []string{"README.md", "main.gno", "test_file.gno", "example_test.gno"},
+				FileName:     "main.gno",
+				FileSize:     "1KB",
+				FileLines:    100,
+				FileCounter:  1,
+				FileDownload: "example/path/main.gno",
+				FileSource:   NewReaderComponent(strings.NewReader("testdata")),
+			},
+			expected: 4,
+		},
+		{
+			name: "No Files",
+			data: SourceData{
+				PkgPath:      "example/path",
+				Files:        []string{},
+				FileName:     "main.gno",
+				FileSize:     "1KB",
+				FileLines:    100,
+				FileCounter:  1,
+				FileDownload: "example/path/main.gno",
+				FileSource:   NewReaderComponent(strings.NewReader("testdata")),
+			},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			view := SourceView(tt.data)
+
+			assert.NotNil(t, view, "expected view to be non-nil")
+
+			tocItemsCount := len(tt.data.Files)
+			assert.Equal(t, tt.expected, tocItemsCount, "expected %d TOC items, got %d", tt.expected, tocItemsCount)
+			assert.Equal(t, SourceViewType, view.Type, "expected view type %s, got %s", SourceViewType, view.Type)
+
+			assert.NoError(t, view.Render(io.Discard))
+		})
+	}
+}
+
+func TestStatusErrorComponent(t *testing.T) {
+	message := "Test Error"
+	view := StatusErrorComponent(message)
+
+	assert.NotNil(t, view, "expected view to be non-nil")
+
+	expectedTitle := "Error: " + message
+	templateComponent, ok := view.Component.(*TemplateComponent)
+	assert.True(t, ok, "expected TemplateComponent type in view.Component")
+
+	statusData, ok := templateComponent.data.(StatusData)
+	assert.True(t, ok, "expected StatusData type in component data")
+
+	assert.Equal(t, expectedTitle, statusData.Title, "expected title %s, got %s", expectedTitle, statusData.Title)
+
+	assert.NoError(t, view.Render(io.Discard))
+}
+
+func TestStatusNoRenderComponent(t *testing.T) {
+	pkgPath := "example/path"
+	view := StatusNoRenderComponent(pkgPath)
+
+	assert.NotNil(t, view, "expected view to be non-nil")
+
+	templateComponent, ok := view.Component.(*TemplateComponent)
+	assert.True(t, ok, "expected TemplateComponent type in view.Component")
+
+	statusData, ok := templateComponent.data.(StatusData)
+	assert.True(t, ok, "expected StatusData type in component data")
+
+	expectedURL := pkgPath + "$source"
+	assert.Equal(t, expectedURL, statusData.ButtonURL, "expected ButtonURL %s, got %s", expectedURL, statusData.ButtonURL)
+
+	assert.NoError(t, view.Render(io.Discard))
+}
+
+func TestRedirectView(t *testing.T) {
+	data := RedirectData{
+		To:        "example/path",
+		Analytics: AnalyticsData{Enabled: true},
+	}
+	view := RedirectView(data)
+
+	assert.NotNil(t, view, "expected view to be non-nil")
+
+	templateComponent, ok := view.Component.(*TemplateComponent)
+	assert.True(t, ok, "expected TemplateComponent type in view.Component")
+
+	redirectData, ok := templateComponent.data.(RedirectData)
+	assert.True(t, ok, "expected RedirectData type in component data")
+
+	assert.Equal(t, data.To, redirectData.To, "expected redirect to %s, got %s", data.To, redirectData.To)
+	assert.Equal(t, data.Analytics.Enabled, redirectData.Analytics.Enabled, "expected Analytics.Enabled to be %v, got %v", data.Analytics.Enabled, redirectData.Analytics.Enabled)
+
+	assert.NoError(t, view.Render(io.Discard))
+}
+
+func TestViewRender(t *testing.T) {
+	component := NewTemplateComponent("ui/toc_generic", nil)
+	view := &View{
+		Type:      "test-view",
+		Component: component,
+	}
+
+	writer := &mockWriter{}
+	err := view.Render(writer)
+	assert.NoError(t, err, "expected no error")
+
+	assert.Equal(t, "rendered", writer.written, "expected 'rendered', got %s", writer.written)
+}
+
+type mockWriter struct {
+	written string
+}
+
+func (m *mockWriter) Write(p []byte) (n int, err error) {
+	m.written = "rendered"
+	return len(p), nil
+}
+
+func TestRealmView(t *testing.T) {
+	content := NewReaderComponent(strings.NewReader("testdata"))
+	tocItems := &RealmTOCData{
+		Items: []*TocItem{
+			{Title: "Introduction", ID: "introduction"},
+		},
+	}
+	data := RealmData{
+		ComponentContent: content,
+		TocItems:         tocItems,
+	}
+
+	view := RealmView(data)
+
+	assert.NotNil(t, view, "expected view to be non-nil")
+
+	templateComponent, ok := view.Component.(*TemplateComponent)
+	assert.True(t, ok, "expected TemplateComponent type in view.Component")
+
+	realmViewParams, ok := templateComponent.data.(realmViewParams)
+	assert.True(t, ok, "expected realmViewParams type in component data")
+
+	assert.Equal(t, content, realmViewParams.Article.ComponentContent, "expected component content to match")
+
+	assert.NoError(t, view.Render(io.Discard))
+}
+
+func TestRealmViewTOCXSSPrevention(t *testing.T) {
+	tests := []struct {
+		name           string
+		tocTitle       string
+		tocID          string
+		mustNotContain []string
+		mustContain    []string
+	}{
+		{
+			name:           "HTML entities in TOC title",
+			tocTitle:       "&lt;script&gt;alert('XSS')&lt;/script&gt; Heading",
+			tocID:          "heading",
+			mustNotContain: []string{"<script>alert", "<script>"},
+			mustContain:    []string{"&amp;lt;script&amp;gt;"},
+		},
+		{
+			name:           "Image tag with onerror via entities",
+			tocTitle:       "&lt;img src=x onerror=alert(1)&gt;",
+			tocID:          "img",
+			mustNotContain: []string{},
+			mustContain:    []string{"&amp;lt;img"},
+		},
+		{
+			name:           "SVG with onload via entities",
+			tocTitle:       "&lt;svg onload=alert(1)&gt;",
+			tocID:          "svg",
+			mustNotContain: []string{},
+			mustContain:    []string{"&amp;lt;svg"},
+		},
+		{
+			name:           "Numeric HTML entities",
+			tocTitle:       "&#60;script&#62;alert(1)&#60;/script&#62;",
+			tocID:          "numeric",
+			mustNotContain: []string{"<script"},
+			mustContain:    []string{"&amp;#60;script"},
+		},
+		{
+			name:           "Normal heading with ampersand",
+			tocTitle:       "API & SDK",
+			tocID:          "api-sdk",
+			mustNotContain: []string{},
+			mustContain:    []string{"API &amp; SDK"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a RealmView with potentially malicious TOC item
+			content := NewReaderComponent(strings.NewReader("test content"))
+			tocItems := &RealmTOCData{
+				Items: []*TocItem{
+					{Title: tt.tocTitle, ID: tt.tocID},
+				},
+			}
+			data := RealmData{
+				ComponentContent: content,
+				TocItems:         tocItems,
+			}
+
+			view := RealmView(data)
+
+			var buf strings.Builder
+			err := view.Render(&buf)
+			assert.NoError(t, err, "expected no error rendering view")
+
+			rendered := buf.String()
+
+			tocStart := strings.Index(rendered, `<ul class="b-toc">`)
+			tocEnd := strings.LastIndex(rendered, `</ul>`)
+			if tocStart == -1 || tocEnd == -1 {
+				t.Fatal("could not find TOC in rendered HTML")
+			}
+			tocHTML := rendered[tocStart : tocEnd+5]
+
+			for _, danger := range tt.mustNotContain {
+				if strings.Contains(tocHTML, danger) {
+					t.Errorf("Found unescaped dangerous pattern %q in TOC HTML.\n"+
+						"TOC HTML: %s",
+						danger, tocHTML)
+				}
+			}
+
+			for _, safe := range tt.mustContain {
+				if !strings.Contains(tocHTML, safe) {
+					t.Errorf("Expected escaped pattern %q not found in TOC HTML.\n"+
+						"Title: %s\nTOC HTML: %s",
+						safe, tt.tocTitle, tocHTML)
+				}
+			}
+		})
+	}
+}
+
+func TestHelpView(t *testing.T) {
+	functions := []HelpFunction{
+		{JSONFunc: &doc.JSONFunc{Name: "Func1", Params: []*doc.JSONField{{Name: "param1"}}}},
+		{JSONFunc: &doc.JSONFunc{Name: "Func2", Params: []*doc.JSONField{{Name: "param1"}, {Name: "param2"}}}},
+	}
+	data := HelpData{
+		SelectedFunc: "Func1",
+		Functions:    functions,
+		RealmName:    "TestRealm",
+	}
+
+	view := HelpView(data)
+
+	assert.NotNil(t, view, "expected view to be non-nil")
+
+	templateComponent, ok := view.Component.(*TemplateComponent)
+	assert.True(t, ok, "expected TemplateComponent type in view.Component")
+
+	helpViewParams, ok := templateComponent.data.(helpViewParams)
+	assert.True(t, ok, "expected helpViewParams type in component data")
+
+	assert.Equal(t, data.RealmName, helpViewParams.RealmName, "expected realm name %s, got %s", data.RealmName, helpViewParams.RealmName)
+
+	assert.NoError(t, view.Render(io.Discard))
+}
+
+// TestHelpViewArgSlots checks each printed arg shares its position with its
+// param's input, in the maketx call and qeval commands alike.
+func TestHelpViewArgSlots(t *testing.T) {
+	params := []*doc.JSONField{{Name: "_", Type: "int"}, {Name: "_", Type: "int"}}
+	view := HelpView(HelpData{
+		PkgPath: "gno.land/r/demo/foo",
+		Functions: []HelpFunction{
+			{JSONFunc: &doc.JSONFunc{Name: "Get", Params: params}},
+			{JSONFunc: &doc.JSONFunc{Name: "Set", Params: params, Crossing: true}},
+		},
+	})
+	var buf strings.Builder
+	require.NoError(t, view.Render(&buf))
+	html := buf.String()
+
+	for _, pos := range []string{"0", "1"} {
+		assert.Equal(t, 2, strings.Count(html, `data-action-function-param-value="_" data-action-function-arg-value="`+pos+`"`), "one input per function")
+		assert.Equal(t, 1, strings.Count(html, `data-action-function-arg-value="`+pos+`" data-action-function-type-value="int"></span>`), "the qeval slot")
+		assert.Equal(t, 2, strings.Count(html, `data-action-function-arg-value="`+pos+`"></span>`), "both modes' maketx call slots")
+	}
+}
+
+// TestHelpViewEval pins what the Actions page's eval scripts read from the
+// markup: each param's type, the live result's texts and the evaluator's
+// entry in the functions list.
+func TestHelpViewEval(t *testing.T) {
+	view := HelpView(HelpData{
+		RealmName: "dao",
+		PkgPath:   "gno.land/r/gov/dao",
+		Remote:    "https://rpc.example:443",
+		Functions: []HelpFunction{{JSONFunc: &doc.JSONFunc{
+			Name:      "AmendBylawsPayload",
+			Signature: "func AmendBylawsPayload(daoID uint64, path, proposed string) string",
+			Params: []*doc.JSONField{
+				{Name: "daoID", Type: "uint64"},
+				{Name: "path", Type: "string"},
+				{Name: "proposed", Type: "string"},
+			},
+		}}},
+	})
+	var buf strings.Builder
+	require.NoError(t, view.Render(&buf))
+	html := buf.String()
+
+	for _, want := range []string{
+		`data-action-function-param-value="daoID" data-action-function-arg-value="0" data-action-function-type-value="uint64"`,
+		`data-action-function-param-value="proposed" data-action-function-arg-value="2" data-action-function-type-value="string"`,
+		`data-qeval-unavailable="(live result unavailable, try again shortly)"`,
+		// The qeval command's args share a position with their param's
+		// input and carry its type, to be written as Gno literals.
+		`data-action-function-param-value="path" data-action-function-arg-value="1" data-action-function-type-value="string"`,
+		`data-action-function-target="arg" data-action-function-arg-value="1" data-action-function-type-value="string"`,
+		`-remote "https://rpc.example:443" -data`,
+		`href="#expression-evaluator"`,
+		`<use href="#ico-eval"></use>`,
+		`id="expression-evaluator"`,
+	} {
+		assert.Contains(t, html, want)
+	}
+	// The Eval button reads the params, not the signature, and nothing
+	// reads the node address from the page any more.
+	assert.NotContains(t, html, `data-action-function-sig-param`)
+	assert.NotContains(t, html, `data-action-function-target="remote"`)
+	// The evaluator's own entry in the Functions list carries the eval icon.
+	assert.Regexp(t, `href="#expression-evaluator">\s*<svg class="c-icon">\s*<use href="#ico-eval">`, html)
+	// The evaluator is listed after the functions.
+	assert.Less(t, strings.Index(html, `href="#func-AmendBylawsPayload"`), strings.Index(html, `href="#expression-evaluator"`))
+	// What works only with JS is served hidden, for the controllers to show:
+	// the Eval button, the evaluator's form and its result.
+	assert.Contains(t, html, `data-action-function-target="eval-button" title="Evaluate function (read-only)" hidden>`)
+	assert.Contains(t, html, `class="b-action-eval-form" data-action-eval-target="js-only" hidden>`)
+	assert.Contains(t, html, `<section class="b-result" data-action-eval-target="js-only" hidden>`)
+	assert.Contains(t, html, `<noscript><p class="u-color-tertiary">The evaluator needs JavaScript.</p></noscript>`)
+}
+
+func TestDirectoryView(t *testing.T) {
+	pkgPath := "example/path"
+	files := []string{"file1.gno", "file2.gno"}
+	fileCounter := 2
+	linkType := DirLinkTypeSource
+	mode := ViewModePackage
+
+	view := DirectoryView(pkgPath, files, fileCounter, linkType, mode)
+
+	assert.NotNil(t, view, "expected view to be non-nil")
+
+	templateComponent, ok := view.Component.(*TemplateComponent)
+	assert.True(t, ok, "expected TemplateComponent type in view.Component")
+
+	dirData, ok := templateComponent.data.(DirData)
+	assert.True(t, ok, "expected DirData type in component data")
+
+	assert.Equal(t, pkgPath, dirData.PkgPath, "expected PkgPath %s, got %s", pkgPath, dirData.PkgPath)
+	assert.Equal(t, len(files), len(dirData.FilesLinks), "expected %d files, got %d", len(files), len(dirData.FilesLinks))
+	assert.Equal(t, fileCounter, dirData.FileCounter, "expected FileCounter %d, got %d", fileCounter, dirData.FileCounter)
+	assert.Equal(t, mode, dirData.Mode, "expected Mode %v, got %v", mode, dirData.Mode)
+
+	assert.NoError(t, view.Render(io.Discard))
+}
+
+func TestDirLinkType_LinkPrefix(t *testing.T) {
+	cases := []struct {
+		name     string
+		linkType DirLinkType
+		pkgPath  string
+		expected string
+	}{
+		{
+			name:     "Source link type",
+			linkType: DirLinkTypeSource,
+			pkgPath:  "/r/test/pkg",
+			expected: "/r/test/pkg$source&file=",
+		},
+		{
+			name:     "File link type",
+			linkType: DirLinkTypeFile,
+			pkgPath:  "/r/test/pkg",
+			expected: "",
+		},
+		{
+			name:     "Invalid link type",
+			linkType: DirLinkType(999),
+			pkgPath:  "/r/test/pkg",
+			expected: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.linkType.LinkPrefix(tc.pkgPath)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestUserView(t *testing.T) {
+	data := UserData{
+		Username: "testuser",
+		Bio:      "This is a test user.",
+		Links: []UserLink{
+			{Type: UserLinkTypeLink, URL: "https://example.com"},
+			{Type: UserLinkTypeGithub, URL: "https://github.com/testuser", Title: "GitHub"},
+		},
+		Contributions: []UserContribution{
+			{
+				Title: "Realm Contribution",
+				Type:  UserContributionTypeRealm,
+			},
+			{
+				Title: "Package Contribution",
+				Type:  UserContributionTypePackage,
+			},
+		},
+		PackageCount: 2,
+		RealmCount:   1,
+		PureCount:    1,
+		Content:      NewReaderComponent(strings.NewReader("Test content")),
+	}
+
+	view := UserView(data)
+
+	assert.NotNil(t, view, "expected view to be non-nil")
+
+	templateComponent, ok := view.Component.(*TemplateComponent)
+	assert.True(t, ok, "expected TemplateComponent type in view.Component")
+
+	userData, ok := templateComponent.data.(UserData)
+	assert.True(t, ok, "expected UserData type in component data")
+
+	// Assert that link title for UserLinkTypeLink was set to the host
+	assert.Equal(t, "example.com", userData.Links[0].Title, "expected link title to be host")
+
+	// Assert counts
+	assert.Equal(t, 1, userData.RealmCount, "expected 1 realm")
+	assert.Equal(t, 2, userData.PackageCount, "expected 2 packages")
+	assert.Equal(t, 1, userData.PureCount, "expected 1 pure package")
+
+	assert.NoError(t, view.Render(io.Discard))
+}
+
+// The view escapes the identity whatever reaches it, in text, in the title
+// attributes and in the copy button's data attribute, and splits an address by
+// runes, so a multi-byte one is never cut into invalid UTF-8.
+func TestUserView_EscapesIdentity(t *testing.T) {
+	const hostile = `"><script>alert(1)</script>`
+	const escaped = `&#34;&gt;&lt;script&gt;alert(1)&lt;/script&gt;`
+
+	render := func(data UserData) string {
+		t.Helper()
+		data.Content = NewReaderComponent(strings.NewReader(""))
+		var buf strings.Builder
+		assert.NoError(t, UserView(data).Render(&buf))
+		return buf.String()
+	}
+
+	t.Run("name", func(t *testing.T) {
+		out := render(UserData{Username: hostile, Address: hostile, CurrentName: hostile})
+		assert.NotContains(t, out, "<script>alert(1)</script>")
+		assert.Contains(t, out, `<h1 class="title title--long">`+escaped+`</h1>`)
+		assert.Contains(t, out, `data-copy-text-value="`+escaped+`"`)
+		// The address line's two halves are escaped each, around the one
+		// literal break point.
+		assert.Contains(t, out, `title="`+escaped+`">&#34;&gt;&lt;script&gt;ale<wbr><span class="address-end" data-controller="copy">rt(1)&lt;/script&gt;<button`)
+		assert.Contains(t, out, `now <a href="/u/%22%3e%3cscript%3ealert%281%29%3c/script%3e">@`+escaped+`</a>`)
+	})
+
+	t.Run("address only", func(t *testing.T) {
+		addr := hostile + strings.Repeat("é", 20) + "\u202e"
+		out := render(UserData{Address: addr})
+		assert.NotContains(t, out, "<script>alert(1)</script>")
+		assert.True(t, utf8.ValidString(out), "the halves are cut on rune boundaries")
+		assert.Contains(t, out, `<h1 class="title title--address u-font-mono" title="`+escaped)
+		assert.Contains(t, out, `data-copy-text-value="`+escaped)
+	})
+}
+
+func TestUserData_LongName(t *testing.T) {
+	assert.False(t, UserData{Username: strings.Repeat("a", 16)}.LongName())
+	assert.True(t, UserData{Username: strings.Repeat("a", 17)}.LongName())
+	// Counted in runes, not bytes.
+	assert.False(t, UserData{Username: strings.Repeat("é", 16)}.LongName())
+}

@@ -1,0 +1,80 @@
+{
+  "tutorialSidebar": [
+    "README",
+    [
+      {
+        "type": "category",
+        "label": "Use Gno.land",
+        "items": [
+          "users/discover-gnoland",
+          "users/explore-with-gnoweb",
+          "users/interact-with-gnokey",
+          "users/example-boards",
+          "users/third-party-wallets",
+          "users/power-users"
+        ]
+      },
+      {
+        "type": "category",
+        "label": "Build on Gno.land",
+        "items": [
+          "builders/what-is-gno",
+          "builders/install",
+          "builders/getting-started",
+          "builders/quickstart",
+          "builders/editor-setup",
+          "builders/tutorial-minisocial",
+          "builders/rpc-clients",
+          "builders/query-state-api",
+          "builders/contributor-guide",
+          "builders/running-a-node"
+        ]
+      },
+      {
+        "type": "category",
+        "label": "References",
+        "items": [
+          "resources/effective-gno",
+          "resources/gno-packages",
+          "resources/community-packages",
+          "resources/gno-data-structures",
+          "resources/gnoland-networks",
+          "resources/rpc-endpoints",
+          "resources/users-and-teams",
+          "resources/gas-fees",
+          "resources/storage-deposit",
+          "resources/gno-stdlibs",
+          "resources/configuring-gno-projects",
+          "resources/gnodev",
+          "resources/gno-testing",
+          "resources/realms",
+          "resources/gno-interrealm",
+          "resources/gno-interrealm-v2",
+          "resources/gno-security",
+          "resources/gno-security-guide",
+          "resources/gno-ai-contract-review",
+          "resources/gno-memory-model",
+          "resources/comparison-of-ways-to-interact-with-gnoland",
+          "resources/glossary",
+          "resources/go-gno-compatibility",
+          "resources/gnoconnect",
+          {
+            "type": "link",
+            "label": "Gno Examples",
+            "href": "https://github.com/gnolang/gno/tree/master/examples"
+          },
+          {
+            "type": "link",
+            "label": "Gno Workshops",
+            "href": "https://github.com/gnolang/workshops"
+          },
+          {
+            "type": "link",
+            "label": "Awesome Gno",
+            "href": "https://github.com/gnoverse/awesome-gno"
+          }
+        ]
+      }
+    ]
+  ]
+}

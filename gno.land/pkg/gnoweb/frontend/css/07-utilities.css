@@ -1,0 +1,176 @@
+/* ==========================================================================
+   07-UTILITIES - Utility classes and overrides (CUBE CSS: Utility + Exception)
+   ========================================================================== */
+
+.u-hidden {
+	display: none;
+}
+.u-inline {
+	display: inline;
+}
+
+.u-skip-link {
+	position: absolute;
+	inset-block-start: var(--g-space-2);
+	inset-inline-start: var(--g-space-2);
+	/* Must outrank .b-header, which is sticky at --g-z-max with an opaque
+	   background over this exact corner. At an equal z-index the header still
+	   wins, being later in the DOM, so the link would be focused but hidden. */
+	z-index: calc(var(--g-z-max) + 1);
+	padding: var(--g-space-2) var(--g-space-4);
+	border-radius: var(--s-rounded-sm);
+	background-color: var(--s-color-bg-base);
+	color: var(--s-color-text-primary);
+	outline: var(--s-focus-ring);
+
+	/* Off-screen until focused rather than display:none, so it stays in the
+	   tab order and is announced. */
+	&:not(:focus-visible) {
+		clip-path: inset(50%);
+		overflow: hidden;
+		white-space: nowrap;
+		block-size: 1px;
+		inline-size: 1px;
+		padding: 0;
+	}
+}
+
+/* The skip link's target: <main>, or on rail views the content past the rail.
+   Clears the sticky .b-header, which would otherwise cover its top: two
+   rows below --lg, one from --lg up. The realm-notice row adds its own
+   scroll-padding (06-blocks). */
+#main-content {
+	scroll-margin-block-start: var(--g-space-28);
+
+	@media (--lg) {
+		scroll-margin-block-start: var(--g-space-16);
+	}
+
+	/* Focused programmatically by the skip link (tabindex="-1"); Chrome
+	   would otherwise ring the whole content box. The link keeps its ring. */
+	&:focus {
+		outline: none;
+	}
+}
+
+.u-sr-only {
+	height: 1px;
+	margin: -1px;
+	overflow: hidden;
+	padding: 0;
+	position: absolute;
+	width: 1px;
+	clip: rect(0, 0, 0, 0);
+	border-width: 0;
+	white-space: nowrap;
+}
+
+/* ===== TEXT UTILITIES ===== */
+.u-italic-subtle {
+	font-style: italic;
+	opacity: 0.8;
+}
+
+.u-word-break {
+	word-break: break-word;
+	overflow-wrap: break-word;
+}
+
+.u-color-valid {
+	color: var(--s-color-bg-brand-default);
+}
+
+.u-color-danger {
+	color: var(--s-color-text-caution);
+}
+
+.u-color-tertiary {
+	color: var(--s-color-text-tertiary);
+}
+
+.u-quotes::before,
+.u-quotes::after {
+	content: '"';
+	color: var(--s-color-text-tertiary);
+}
+
+.u-text-stroke {
+	-webkit-text-stroke: currentColor;
+	-webkit-text-stroke-width: 0.6px;
+}
+
+.u-font-mono {
+	font-family: var(--g-font-family-mono);
+}
+
+.u-capitalize {
+	text-transform: capitalize;
+}
+
+.u-text-center {
+	text-align: center;
+}
+
+/* ===== SCROLLBAR UTILITIES ===== */
+.u-no-scrollbar::-webkit-scrollbar {
+	display: none;
+}
+
+.u-no-scrollbar {
+	-ms-overflow-style: none;
+	scrollbar-width: none;
+}
+
+/* ===== STATE UTILITIES ===== */
+.u-is-loading {
+	opacity: 0;
+}
+
+.u-pointer-events-none {
+	pointer-events: none;
+}
+
+.u-icon-static {
+	width: var(--g-space-4);
+	height: var(--g-space-4);
+}
+
+/* ===== SPACE UTILITIES ===== */
+.u-gap-0 {
+	gap: 0;
+}
+
+.u-mt-4 {
+	margin-block-start: var(--g-space-4);
+}
+
+.u-mb-0 {
+	margin-block-end: 0;
+}
+
+.u-mb-2 {
+	margin-block-end: var(--g-space-2);
+}
+.u-lg-mb-4 {
+	@media (--lg) {
+		margin-block-end: var(--g-space-4);
+	}
+}
+
+.u-grid-row-1 {
+	grid-row-start: 1;
+}
+
+.u-grid-full {
+	grid-column: 1 / -1;
+}
+
+/* ===== FOCUS UTILITIES ===== */
+.u-focus-no-field-sizing-w-20:focus {
+	width: 5rem;
+}
+
+/* ===== EMPTY STATE UTILITIES ===== */
+*:empty + .u-prev-empty {
+	margin-top: var(--g-space-4);
+}

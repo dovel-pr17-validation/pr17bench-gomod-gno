@@ -1,0 +1,451 @@
+# Getting started
+
+Gno.land is a Layer 1 blockchain where smart contracts are written in
+**[Gno](./what-is-gno.md)**, a deterministic variant of Go. If you
+know Go, you can write Gno minus what doesn't fit on-chain: no
+goroutines, no `os`, no networking, and only standard-library or
+`gno.land/...` imports. See
+[Go vs Gno compatibility](../resources/go-gno-compatibility.md) for the
+full list.
+
+This page walks you from zero to a working local chain and your first
+on-chain transaction. For just the commands, see [Quick Start](./quickstart.md).
+
+:::tip
+Try the **[Playground](https://play.gno.land)** to write Gno in your browser.
+:::
+
+## Install
+
+This tutorial uses three of the toolchain binaries:
+
+| Binary    | What it is                                              |
+|-----------|---------------------------------------------------------|
+| `gno`     | the Gno language toolchain (format, test, run, mod init)|
+| `gnokey`  | key management for interacting with the network         |
+| `gnodev`  | local development environment with hot reload + web UI  |
+
+Install all three with the [one-line installer](./install.md#one-line-installer):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gnolang/gno/master/misc/install.sh | sh
+```
+
+Binaries land in `$HOME/.gno/bin`. The installer supports Linux and
+macOS; on Windows use WSL. See the [Installation page](./install.md) for
+source builds, Docker, version pinning with `--version <tag>`, or a full
+validator node with `--full`.
+
+Verify the toolchain is on your `$PATH`:
+
+```sh
+gno version && gnokey version && gnodev --help
+```
+
+:::tip
+`gno: command not found`? Add `$HOME/.gno/bin` to your `$PATH`:
+`export PATH="$PATH:$HOME/.gno/bin"`.
+:::
+
+For autocompletion, diagnostics, and formatting in your editor, see
+[Editor Setup](./editor-setup.md).
+
+## Build and run locally
+
+The fastest way to learn Gno is to run a chain on your own machine.
+`gnodev` boots a local devnet with hot reload, a built-in web UI,
+and pre-funds accounts so you can deploy and call code right away.
+
+You'll write a small realm, run it through the local toolchain, boot
+the chain, then call it with a real transaction. Everything in this
+section runs offline.
+
+### 1. Declare the module path
+
+In a new directory for your realm, run this command to set its
+on-chain path:
+
+```sh
+gno mod init gno.land/r/myname/myrealm
+```
+
+It writes a `gnomod.toml`:
+
+```toml
+module = "gno.land/r/myname/myrealm"
+gno = "0.9"
+```
+
+The `gno` line is the language version it targets. Use `gno.land/r/…`
+for realms (stateful) or `gno.land/p/…` for pure packages (stateless).
+Note that pure packages cannot import realms; see
+[import rules](../resources/gno-packages.md#import-rules).
+
+### 2. Write Gno code
+
+Add `.gno` files next to the freshly created `gnomod.toml`. We'll
+build a counter, a realm that stores a number and exposes a function to
+increment it:
+
+```gno
+package myrealm
+
+import "strconv"
+
+var count int
+
+func Increment(_ realm) int {
+	count++
+	return count
+}
+
+func Render(path string) string {
+	return "Count: " + strconv.Itoa(count)
+}
+```
+
+- **`var count int`**: top-level variables are automatically persisted
+  to chain state after each transaction.
+- **`Increment`**: the `_ realm` first parameter makes it a
+  [crossing function](../resources/gno-interrealm-v2.md). Making the call crossing with
+  `Increment(cross(cur))` changes the scope of the transaction to this
+  realm, which allows it to update the realm's state. The test calls it
+  that way; from `gnokey` it happens automatically.
+- **`Render`**: gnoweb calls this to display your realm in the
+  browser. It takes the URL path as a `string` and returns a Markdown
+  `string`, which gnoweb renders into the page.
+
+Add a test file alongside it, `myrealm_test.gno`:
+
+```gno
+package myrealm
+
+import "testing"
+
+func TestIncrement(cur realm, t *testing.T) {
+	val := Increment(cross(cur))
+	if val != 1 {
+		t.Fatalf("expected 1, got %d", val)
+	}
+}
+```
+
+For deeper test patterns see the [Testing guide](../resources/gno-testing.md); a
+fuller version of this counter lives at
+[`examples/gno.land/r/demo/counter`](https://github.com/gnolang/gno/tree/master/examples/gno.land/r/demo/counter).
+
+### 3. Format, lint, and test
+
+The `gno` CLI ships the same toolchain you'd expect from Go: a formatter
+that rewrites code in canonical style, a linter that catches common
+mistakes (unused imports and variables, misuse of `cross`/`realm`), and
+a test runner that executes `_test.gno` files. Run them from the package
+directory before every commit:
+
+```sh
+gno fmt ./...     # rewrite .gno files in canonical style
+gno lint ./...    # static checks for common mistakes
+gno test ./...    # run _test.gno files
+```
+
+### 4. Create a key
+
+To deploy your realm or call `Increment`, you sign each action with a
+key. A **key** is a private/public keypair managed locally by `gnokey`:
+the private side signs your transactions, and the public side derives
+the `g1…` address that identifies you on chain.
+
+Create one:
+
+```sh
+gnokey add alice
+```
+
+It prompts for an encryption password and prints a 24-word mnemonic.
+Store it somewhere safe to recover the key later. List your keys
+to see the derived `g1...` address:
+
+```sh
+gnokey list
+```
+
+```text
+0. alice (local) - addr: g1abc...xyz pub: gpub1pgf..., path: <nil>
+```
+
+That `g1...` address is your on-chain identity. It owns funds, signs
+transactions, and forms the base of your address-based namespace
+when you deploy to a shared network.
+
+:::warning
+Keys created this way are **development-only**. Do not reuse the
+mnemonic for real funds.
+:::
+
+For key import, derivation, and the full keybase reference, see
+[Interact with gnokey](../users/interact-with-gnokey.md#managing-key-pairs).
+
+### 5. Run a local chain
+
+Once the code passes tests, boot a devnet from the package directory.
+`gnodev` starts a single-node chain, loads the realm at its declared
+package path, and serves gnoweb in the foreground:
+
+```sh
+gnodev .
+```
+
+Open http://localhost:8888, where gnoweb shows your realm. Click into it
+to see the `Render` output ("Count: 0"), browse exported functions and
+source code, and view prefunded account balances. Every key in your
+local `gnokey` keybase is auto-funded at startup, so `alice` already has
+GNOT to spend. No faucet needed.
+
+Save a `.gno` file and the chain reloads automatically. Pass
+additional directories on the command line to load several packages
+at once.
+
+### 6. Call Increment
+
+Every realm page in gnoweb has three tabs in the top header:
+**Content** (the `Render` output you've already seen), **Source**
+(the `.gno` files), and **Actions**. The Actions tab introspects the
+realm's exported crossing functions and, for each one, gives you both
+a form to call it from the browser via a connected wallet such as
+[Adena](../users/third-party-wallets.md), and the equivalent `gnokey`
+command pre-filled with the values you've typed, copy-pasteable and
+ready to run.
+
+For `Increment`, the command looks like this:
+
+```sh
+gnokey maketx call \
+  -pkgpath "gno.land/r/myname/myrealm" \
+  -func "Increment" \
+  -gas-fee 2000ugnot -gas-wanted 2000000 \
+  -chainid dev -remote http://localhost:26657 \
+  alice
+```
+
+`-pkgpath` is the realm's on-chain path, the same one you passed to
+`gno mod init`.
+
+`-gas-wanted` caps the gas the transaction may use, and `-gas-fee` is the whole
+fee, one flat amount in `ugnot`. The fee divided by the gas wanted must reach
+the network's gas price, 1ugnot per 1000 gas at its floor, so 2000000 gas needs
+at least 2000ugnot. [Gas fees](../resources/gas-fees.md) explains both flags and
+how `-simulate only` sizes them.
+
+The signer at the end is the `alice` key you just created. You'll
+reuse it when you deploy to a shared network below.
+
+On success you'll see:
+
+```text
+(1 int)
+OK!
+GAS WANTED: 2000000
+GAS USED:   1685054
+HEIGHT:     5
+STORAGE DELTA:  10 bytes
+STORAGE FEE:    1000ugnot
+TOTAL TX COST:  3000ugnot
+EVENTS:     [{"bytes_delta":10,"fee_delta":{"denom":"ugnot","amount":1000},"pkg_path":"gno.land/r/myname/myrealm"}]
+INFO:
+TX HASH:    yBwJPI1anzP44QZMLV6Sae6SZsrLqK8UhZWUOyd5T48=
+```
+
+`STORAGE FEE` is the [storage deposit](../resources/storage-deposit.md) locked
+for the 10 bytes `count` grew by, and `TOTAL TX COST` adds it to the gas fee.
+
+The leading `(1 int)` is `Increment`'s return value. Reload the realm
+page and `Render` flips from "Count: 0" to "Count: 1"; re-run to keep
+incrementing.
+
+For more options, see
+[Running a local dev node](../resources/gnodev.md).
+
+## Deploy to a shared network
+
+Now publish your realm to a shared network so others can reach it.
+Two things change compared to `gnodev`: keys aren't auto-funded, so
+you'll need test `ugnot` from a faucet, and each deploy is one
+explicit `addpkg` transaction instead of hot-reload on file save.
+
+Pick a target network now and use it consistently. The faucet's
+network dropdown and every `gnokey` command's `-remote` and
+[`-chainid`](../resources/gnoland-networks.md#network-configurations) flags must match:
+
+| Network    | `-chainid`   | `-remote`                                     |
+|------------|--------------|-----------------------------------------------|
+| Local      | `dev`        | `http://localhost:26657`                      |
+| Staging    | `staging`    | `https://rpc.staging.gno.land:443`            |
+| Testnet    | `onyx-1`     | `https://rpc.onyx.testnets.gno.land:443`      |
+| Mainnet    | `gnoland-1`  | `https://rpc.gno.land:443`                    |
+
+Onyx is the current testnet: it runs mainnet's code (each mainnet release first, as its release candidate) and package set, with a faucet. See [Networks](../resources/gnoland-networks.md) for the live list.
+
+Examples below use the **testnet** through its `latest` endpoint, which
+always points at the current testnet. Its chain ID changes with each
+testnet, so put the current one in place of `<chain-id>`. The testnet
+upgrades in place with each release, so a realm you deploy there carries
+over from one release to the next.
+
+**Mainnet** (`gnoland-1`) is the production
+network: no faucet, and token transfers, locked at launch per Constitution
+§126, have since been unlocked by GovDAO: deploying there means holding
+unlocked GNOT, from the genesis allocation or a transfer.
+
+### 1. Get test tokens
+
+Deploys cost [gas](../resources/gas-fees.md) and lock a
+[storage deposit](../resources/storage-deposit.md), both paid in `ugnot`. Get
+tokens from the faucet: go to **[faucet.gno.land](https://faucet.gno.land)**,
+paste your `g1…` address, pick the current testnet, and submit. Tokens
+arrive in seconds. The faucet is rate-limited per address; wait out the
+cooldown if a re-request is rejected.
+
+### 2. Query on-chain
+
+Confirm the funds landed before spending them on a deploy:
+
+```sh
+gnokey query bank/balances/<your-g1-addr> -remote https://rpc.latest.testnets.gno.land:443
+```
+
+Response shows your balance as `<amount>ugnot`. Read-only queries like this
+don't need a chainid or a key; they hit the RPC endpoint directly.
+
+### 3. Before you deploy
+
+Two things to know before publishing your first package:
+
+**Namespaces.** The simplest path is your own address-based namespace,
+`gno.land/r/<your-g1-addr>/…`. Every account gets one and only that
+account can deploy under it, so there's nothing to register. A named
+namespace like `gno.land/r/<name>/…` requires registering the name
+on-chain first. See [Users and Teams](../resources/users-and-teams.md).
+
+**CLA.** Some networks require contributors to acknowledge and sign a
+[Contributor License Agreement](https://github.com/gnolang/gno/blob/master/CLA.md)
+before deploying. It is currently off on every network; check
+[mainnet](https://gno.land/r/sys/cla) or
+[the testnet](https://latest.testnets.gno.land/r/sys/cla) to confirm. If
+`addpkg` ever fails with `has not signed the required CLA`, sign once at
+[`r/sys/cla`](https://gno.land/r/sys/cla) and retry.
+
+### 4. Deploy your package
+
+`addpkg` uploads your package directory and its `gnomod.toml` to the
+network as a single package. Deploy yours:
+
+```sh
+gnokey maketx addpkg \
+  -pkgpath "gno.land/r/<your-g1-addr>/myrealm" \
+  -pkgdir . \
+  -gas-fee 5000ugnot -gas-wanted 5000000 \
+  -chainid <chain-id> -remote https://rpc.latest.testnets.gno.land:443 \
+  alice
+```
+
+`-pkgdir` is the local directory to upload, where `.` means the current
+directory. The `alice` key at the end signs the transaction. On success
+you'll see:
+
+```text
+OK!
+GAS WANTED: 5000000
+GAS USED:   2961787
+HEIGHT:     12345
+STORAGE DELTA:  3187 bytes
+STORAGE FEE:    318700ugnot
+TOTAL TX COST:  323700ugnot
+EVENTS:     [{"bytes_delta":3187,"fee_delta":{"denom":"ugnot","amount":318700},"pkg_path":"gno.land/r/<your-g1-addr>/myrealm"}]
+INFO:
+TX HASH:    wpp4PT6fsm8IoCiCl8LMTEVqvJvNHoTiuZOJPFu5P8c=
+PKGPATH:    gno.land/r/<your-g1-addr>/myrealm
+```
+
+The deposit is far bigger than the fee here, and that is normal for a deploy:
+every byte of code and state your package adds locks 100ugnot, 318700ugnot for
+the 3187 bytes above.
+
+The testnet enables a new package a few seconds after `addpkg`; if `call`
+fails right after a deploy, wait and retry.
+`https://gpao.latest.testnets.gno.land/status/<pkgpath>` says why a package
+was refused. It only knows packages submitted since its service last
+restarted, so if it still reads `unknown` after a minute, ask on
+[Discord](https://discord.com/invite/gnoland). Once enabled, the package is
+browsable at
+**`https://latest.testnets.gno.land/r/<your-g1-addr>/myrealm`**.
+
+One optional flag is worth knowing about:
+- `-max-deposit <amount>ugnot`: cap the [storage deposit](../resources/storage-deposit.md)
+  the chain may lock; a transaction needing more than the cap is refused. This
+  deploy locked 318700ugnot, so `-max-deposit 400000ugnot` leaves room to
+  spare.
+
+For the full flag list, see
+[`addpkg` in Interact with gnokey](../users/interact-with-gnokey.md#addpackage).
+You can also deploy via the [Playground](https://play.gno.land) with a browser
+wallet like Adena.
+
+### 5. Call Increment
+
+Same shape as the local call earlier. Only the package path, `-chainid` and
+`-remote` change. Call it:
+
+```sh
+gnokey maketx call \
+  -pkgpath "gno.land/r/<your-g1-addr>/myrealm" \
+  -func "Increment" \
+  -gas-fee 2000ugnot -gas-wanted 2000000 \
+  -chainid <chain-id> -remote https://rpc.latest.testnets.gno.land:443 \
+  alice
+```
+
+On success the response leads with the return value, then the tx
+receipt:
+
+```text
+(1 int)
+OK!
+GAS WANTED: 2000000
+GAS USED:   1685054
+HEIGHT:     12346
+STORAGE DELTA:  10 bytes
+STORAGE FEE:    1000ugnot
+TOTAL TX COST:  3000ugnot
+EVENTS:     [{"bytes_delta":10,"fee_delta":{"denom":"ugnot","amount":1000},"pkg_path":"gno.land/r/<your-g1-addr>/myrealm"}]
+INFO:
+TX HASH:    gQP9fJYrZMTK3GgRiio3/V35smzg/jJ62q7t4TLpdV4=
+```
+
+To read the state without spending gas, query the realm's render:
+
+```sh
+gnokey query vm/qrender \
+  -data "gno.land/r/<your-g1-addr>/myrealm:" \
+  -remote https://rpc.latest.testnets.gno.land:443
+```
+
+This returns the `Render` output ("Count: 1"), a free, read-only
+view of your realm's state. For the full `maketx call` and `gnokey`
+reference, see [Interact with gnokey](../users/interact-with-gnokey.md).
+
+## Next steps
+
+1. [r/docs](https://github.com/gnolang/gno/tree/master/examples/quarantined/gno.land/r/docs): example realms, one per concept
+2. [Effective Gno](../resources/effective-gno.md): idiomatic patterns
+3. [Example: the `minisocial` dApp](./tutorial-minisocial.md): end-to-end with deploy
+4. [Gas fees](../resources/gas-fees.md): pricing, estimation, and the "out of gas" fix
+5. [Storage deposit](../resources/storage-deposit.md): how on-chain storage is paid for, and how to cap it with `-max-deposit`
+
+## Getting help
+
+- **[Discord](https://discord.com/invite/gnoland)**: community chat.
+- **[Gno Forum](https://gno.land/r/gnoland/boards2/v0)**: long-form
+  questions and proposals, on-chain.
+- **[GitHub issues](https://github.com/gnolang/gno/issues)**: bugs,
+  feature requests, roadmap.
+- **[@_gnoland on X](https://twitter.com/_gnoland)**: announcements.

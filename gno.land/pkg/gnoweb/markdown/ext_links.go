@@ -1,0 +1,520 @@
+package markdown
+
+import (
+	"errors"
+	"net/url"
+	"strings"
+
+	"github.com/gnolang/gno/gno.land/pkg/gnoweb/weburl"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/parser"
+	"github.com/yuin/goldmark/renderer"
+	"github.com/yuin/goldmark/renderer/html"
+	"github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/util"
+)
+
+// Error messages for invalid link formats
+var ErrLinkInvalidURL = errors.New("invalid URL format")
+
+const (
+	// Tooltips info for link types
+	tooltipExternalLink = "External link"
+	tooltipInternalLink = "Cross package link"
+	tooltipTxLink       = "Transaction link"
+	tooltipUserLink     = "User profile"
+
+	// SVG icon ids for link types
+	iconExternalLink = "ico-external-link"
+	iconInternalLink = "ico-internal-link"
+	iconTxLink       = "ico-tx-link"
+	iconUserLink     = "ico-user-link"
+
+	// CSS classes for link types
+	classLinkExternal = "link-external"
+	classLinkInternal = "link-internal"
+	classLinkTx       = "link-tx"
+	classLinkUser     = "link-user"
+)
+
+// GnoLinkType represents the type of a link
+type GnoLinkType int
+
+const (
+	GnoLinkTypeInvalid GnoLinkType = iota
+	GnoLinkTypeExternal
+	GnoLinkTypePackage
+	GnoLinkTypeInternal
+	GnoLinkTypeUser
+)
+
+func (t GnoLinkType) String() string {
+	switch t {
+	case GnoLinkTypeExternal:
+		return "external"
+	case GnoLinkTypePackage:
+		return "package"
+	case GnoLinkTypeInternal:
+		return "internal"
+	case GnoLinkTypeUser:
+		return "user"
+	}
+	return "unknown"
+}
+
+// LinkPolicy says which links of a document search engines may follow. A
+// link they may not follow renders with rel="nofollow ugc": it was written by
+// someone the site does not answer for. The zero value follows none, so a
+// document rendered without a policy is treated as user content.
+type LinkPolicy int
+
+const (
+	// FollowNoLinks marks every link as user content: a community document.
+	FollowNoLinks LinkPolicy = iota
+	// FollowInternalLinks follows links within the site and marks the others:
+	// a trusted realm may still show what its users wrote.
+	FollowInternalLinks
+	// FollowAllLinks follows every link: a page the operator wrote.
+	FollowAllLinks
+)
+
+// follows reports whether a link of type t may be followed under p.
+func (p LinkPolicy) follows(t GnoLinkType) bool {
+	switch p {
+	case FollowAllLinks:
+		return true
+	case FollowInternalLinks:
+		return t != GnoLinkTypeExternal
+	default:
+		return false
+	}
+}
+
+var KindGnoLink = ast.NewNodeKind("GnoLink")
+
+// GnoLink represents a link with Gno-specific metadata
+type GnoLink struct {
+	*ast.Link
+	LinkType GnoLinkType
+	GnoURL   *weburl.GnoURL
+	// Untrusted marks a link parsed from a <gno-foreign> sandbox (the
+	// inner instance's context is flagged via markForeignOrigin). Such
+	// links render as user-generated content — rel="noopener nofollow
+	// ugc" and no first-party tx/internal trust icons — so foreign
+	// markdown cannot wear the host realm's link chrome. The href is
+	// still resolved normally; only the trust signals are stripped.
+	Untrusted bool
+	// Followed reports whether search engines may follow the link, from the
+	// document's LinkPolicy. An untrusted link is never followed.
+	Followed bool
+}
+
+// rel is the link's rel attribute: noopener on a link to another site or
+// out of a sandbox, nofollow ugc on a link search engines may not follow.
+func (n *GnoLink) rel() string {
+	opener := n.Untrusted || n.LinkType == GnoLinkTypeExternal
+	switch {
+	case opener && !n.Followed:
+		return "noopener nofollow ugc"
+	case opener:
+		return "noopener"
+	case !n.Followed:
+		return "nofollow ugc"
+	default:
+		return ""
+	}
+}
+
+func (n *GnoLink) Dump(source []byte, level int) {
+	m := map[string]string{}
+	m["Destination"] = string(n.Destination)
+	m["Title"] = string(n.Title)
+	m["LinkType"] = n.LinkType.String()
+	if n.Untrusted {
+		m["Untrusted"] = "true"
+	}
+	ast.DumpHelper(n, source, level, m, nil)
+}
+
+// Kind implements Node.Kind.
+func (*GnoLink) Kind() ast.NodeKind {
+	return KindGnoLink
+}
+
+// resolveDestination resolves a raw markdown link destination the same way
+// goldmark's util.URLEscape(dst, true) does before an href is emitted:
+// backslash-escaped punctuation, then numeric references, then named
+// entities.
+//
+// Every consumer that inspects a destination must run it through this
+// first. Deciding anything from the raw bytes is a security bug: goldmark
+// resolves `&#x6a;avascript:` to `javascript:` on the way out, so a raw
+// check sees a harmless relative path where the browser will see a
+// dangerous scheme. That applies to the dangerous-scheme check, to the
+// link classifier (which drives rel="noopener nofollow ugc" and the
+// external-link icon), and to the image validator.
+func resolveDestination(dst []byte) []byte {
+	return util.ResolveEntityNames(util.ResolveNumericReferences(util.UnescapePunctuations(dst)))
+}
+
+// escapeDestination is the inverse of resolveDestination: it turns a
+// resolved URL back into destination bytes that resolve to that same URL.
+// Backslashes and ampersands are the only bytes the resolution acts on.
+func escapeDestination(resolved string) []byte {
+	resolved = strings.ReplaceAll(resolved, `\`, `\\`)
+	resolved = strings.ReplaceAll(resolved, "&", "&amp;")
+	return []byte(resolved)
+}
+
+// newRawLabelLink builds an ast.Link to dest whose label is raw text: it
+// is escaped on output, never parsed as markdown. Autolinks and buttons
+// become such links.
+func newRawLabelLink(dest, label []byte) *ast.Link {
+	link := ast.NewLink()
+	link.Destination = dest
+	text := ast.NewString(label)
+	text.SetRaw(true)
+	link.AppendChild(link, text)
+	return link
+}
+
+// trimLeadingControlAndSpace drops the bytes a URL parser strips before it
+// reads the scheme: leading C0 controls and space (WHATWG URL, "remove any
+// leading and trailing C0 control or space"). Any check that compares a
+// scheme or a media type against a prefix has to trim first, or a single
+// leading byte shifts the prefix and the check sees nothing to match.
+func trimLeadingControlAndSpace[T string | []byte](s T) T {
+	for len(s) > 0 && s[0] <= ' ' {
+		s = s[1:]
+	}
+	return s
+}
+
+// linkClassAttr carries a class for the rendered <a>, set by parsers that
+// emit a styled link (see ext_buttons.go). Like mentionLinkAttr, the name is
+// not "data-"-prefixed, so goldmark never serializes it on its own and a
+// markdown `{.class}` attribute cannot set it.
+var linkClassAttr = []byte("gno:class")
+
+// linkTransformer implements ASTTransformer
+type linkTransformer struct{}
+
+// Transform replaces ast.Link and ast.AutoLink nodes with GnoLink nodes.
+func (t *linkTransformer) Transform(doc *ast.Document, reader text.Reader, pc parser.Context) {
+	orig, ok := getUrlFromContext(pc)
+	if !ok {
+		return
+	}
+
+	// Links parsed under a <gno-foreign> sandbox context render as
+	// untrusted (rel="ugc", no first-party trust icons). Read once.
+	untrusted := isForeignOrigin(pc)
+	links := getLinkPolicyFromContext(pc)
+
+	// An autolink is replaced by a new node, which detaches it from its
+	// parent and ends ast.Walk's sibling loop there: every link after it in
+	// the same paragraph would skip this transformer. Replace autolinks once
+	// the walk is done instead.
+	var autolinks []*ast.AutoLink
+
+	ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+
+		var (
+			gnoLink *GnoLink
+			rawDest []byte
+		)
+
+		// Per-node trust: ordinary links from a foreign sandbox are
+		// untrusted, but a mention is a system-resolved /u/<name>
+		// reference (not an author-chosen destination), so it keeps its
+		// first-party user chrome — see ext_mentions.go / mentionLinkAttr.
+		nodeUntrusted := untrusted
+
+		switch n := node.(type) {
+		case *ast.Link:
+			// Wrap the existing link node directly.
+			gnoLink = &GnoLink{Link: n}
+			rawDest = n.Destination
+			if _, isMention := n.Attribute(mentionLinkAttr); isMention {
+				nodeUntrusted = false
+			}
+
+		case *ast.AutoLink:
+			autolinks = append(autolinks, n)
+			return ast.WalkContinue, nil
+
+		default:
+			return ast.WalkContinue, nil
+		}
+		gnoLink.Untrusted = nodeUntrusted
+		replaceWithGnoLink(node, gnoLink, rawDest, orig, links)
+		return ast.WalkContinue, nil
+	})
+
+	source := reader.Source()
+	for _, n := range autolinks {
+		// Build a synthetic ast.Link so the existing renderGnoLink handles
+		// IsDangerousURL, rel attributes, and icons for autolinks too.
+		var rawDest []byte
+		rawURL := n.URL(source)
+		if n.AutoLinkType == ast.AutoLinkEmail {
+			rawDest = append([]byte("mailto:"), rawURL...)
+		} else {
+			rawDest = rawURL
+		}
+		gnoLink := &GnoLink{Link: newRawLabelLink(rawDest, n.Label(source)), Untrusted: untrusted}
+		replaceWithGnoLink(n, gnoLink, rawDest, orig, links)
+	}
+}
+
+// replaceWithGnoLink puts gnoLink in node's place, classifies its
+// destination and decides from links whether search engines may follow it.
+func replaceWithGnoLink(node ast.Node, gnoLink *GnoLink, rawDest []byte, orig *weburl.GnoURL, links LinkPolicy) {
+	parent, next := node.Parent(), node.NextSibling()
+	parent.RemoveChild(parent, node)
+	parent.InsertBefore(parent, next, gnoLink)
+
+	// Parse destination URL and check for validity. The classifier
+	// must see the same bytes the renderer will emit — see
+	// resolveDestination.
+	dest, err := url.Parse(string(resolveDestination(rawDest)))
+	if err != nil {
+		gnoLink.LinkType = GnoLinkTypeInvalid
+		return
+	}
+
+	// Detect and set the GnoLink type.
+	gnoLink.GnoURL, gnoLink.LinkType = detectLinkType(dest, orig)
+	gnoLink.Followed = !gnoLink.Untrusted && links.follows(gnoLink.LinkType)
+}
+
+// detectLinkType detects the type of link based on the destination
+func detectLinkType(dest *url.URL, orig *weburl.GnoURL) (*weburl.GnoURL, GnoLinkType) {
+	// A scheme without a host (https:///evil.com) still leads browsers to
+	// a host: they skip the extra slashes.
+	if dest.Scheme != "" && dest.Host == "" {
+		return nil, GnoLinkTypeExternal
+	}
+
+	// Attempt to parse the destination as a GnoURL.
+	target, err := weburl.ParseFromURL(dest)
+	if err != nil {
+		// No scheme: a relative path, unless it names a host. A
+		// protocol-relative URL (//host/...) is external unless the host is
+		// ours, and browsers also read a path starting with "//" (///host)
+		// as a host.
+		if dest.Scheme == "" && !strings.HasPrefix(dest.Path, "//") &&
+			(dest.Host == "" || strings.EqualFold(dest.Hostname(), orig.Domain)) {
+			return nil, GnoLinkTypePackage
+		}
+
+		// Otherwise, treat it as an external URL.
+		return nil, GnoLinkTypeExternal
+	}
+
+	// Extract domain and namespace from the target.
+	targetDomain := target.Domain
+	targetName := target.Namespace()
+
+	switch {
+	case targetDomain != "" && targetDomain != orig.Domain:
+		// External: the domain does not match the origin's domain.
+		return target, GnoLinkTypeExternal
+	case target.IsUser():
+		// User: checked after the host, so an off-site /u/ path is external.
+		return target, GnoLinkTypeUser
+	case targetName != "" && targetName == orig.Namespace():
+		// Package: the namespace matches the origin's namespace.
+		return target, GnoLinkTypePackage
+	default:
+		// Internal: it's neither external nor a package link.
+		return target, GnoLinkTypeInternal
+	}
+}
+
+// linkRenderer implements NodeRenderer
+type linkRenderer struct{}
+
+// RegisterFuncs registers the renderer functions
+func (r *linkRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
+	reg.Register(KindGnoLink, r.renderGnoLink)
+}
+
+// attr represents an HTML attribute
+type attr struct {
+	name  string
+	value string
+}
+
+// renderStringAttributes writes an HTML attribute.
+// variant of html.RenderAttributes with custom attributes
+// XXX: We probably want this as a general helper for futur extension.
+func renderStringAttributes(w util.BufWriter, attrs []attr) {
+	for _, attr := range attrs {
+		w.WriteByte(' ')
+		w.WriteString(attr.name)
+		w.WriteString(`="`)
+		w.Write(util.EscapeHTML(util.StringToReadOnlyBytes(attr.value)))
+		w.WriteByte('"')
+	}
+}
+
+// linkTypeInfo contains information about a link type.
+type linkTypeInfo struct {
+	tooltip string
+	iconID  string
+	class   string
+}
+
+// getLinkIcons returns all icons that should be displayed for a given link
+func getLinkIcons(n *GnoLink) []linkTypeInfo {
+	var icons []linkTypeInfo
+
+	// Untrusted (foreign-sandbox) links: suppress the first-party
+	// chrome (internal/user/tx icons) so sandboxed content cannot
+	// borrow the host realm's trust signals. The external-link icon is
+	// kept — it is a "leaves the page" safety hint, not a trust badge.
+	if n.Untrusted {
+		if n.LinkType == GnoLinkTypeExternal {
+			icons = append(icons, linkTypeInfo{tooltipExternalLink, iconExternalLink, classLinkExternal})
+		}
+		return icons
+	}
+
+	// Add type-specific icon (external/internal)
+	if n.LinkType != GnoLinkTypePackage {
+		switch n.LinkType {
+		case GnoLinkTypeExternal:
+			icons = append(icons, linkTypeInfo{tooltipExternalLink, iconExternalLink, classLinkExternal})
+		case GnoLinkTypeInternal:
+			icons = append(icons, linkTypeInfo{tooltipInternalLink, iconInternalLink, classLinkInternal})
+		case GnoLinkTypeUser:
+			icons = append(icons, linkTypeInfo{tooltipUserLink, iconUserLink, classLinkUser})
+		}
+	}
+
+	// Add Tx icon for non-external links with help webquery
+	if n.LinkType != GnoLinkTypeExternal && n.GnoURL != nil && n.GnoURL.WebQuery.Has("help") {
+		icons = append(icons, linkTypeInfo{tooltipTxLink, iconTxLink, classLinkTx})
+	}
+
+	return icons
+}
+
+// renderGnoLink renders a link node.
+func (r *linkRenderer) renderGnoLink(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	n, ok := node.(*GnoLink)
+	if !ok {
+		return ast.WalkContinue, nil
+	}
+
+	if n.LinkType == GnoLinkTypeInvalid {
+		// No <a> is emitted — the destination is unusable, and with no href
+		// there is nothing for a dangerous scheme to reach. The link TEXT is
+		// still realm content, so keep walking children and render it as
+		// plain inline text. Dropping it would delete author-visible copy
+		// for inputs that merely resolve to something net/url rejects
+		// (`&percnt;` in an absolute path, an entity-encoded C0 control),
+		// not just for attacks.
+		if entering {
+			w.WriteString("<!-- invalid link -->")
+		}
+		return ast.WalkContinue, nil
+	}
+
+	if entering {
+		w.WriteString(`<a href="`)
+		dest := resolveDestination(n.Destination)
+		if !html.IsDangerousURL(trimLeadingControlAndSpace(dest)) {
+			w.Write(util.EscapeHTML(util.URLEscape(dest, false)))
+		}
+		w.WriteByte('"')
+
+		// Prepare additional link attributes.
+		attrs := []attr{}
+		if class, ok := n.Attribute(linkClassAttr); ok {
+			attrs = append(attrs, attr{"class", class.(string)})
+		}
+		if rel := n.rel(); rel != "" {
+			attrs = append(attrs, attr{"rel", rel})
+		}
+		if n.Title != nil {
+			attrs = append(attrs, attr{"title", string(n.Title)})
+		}
+
+		// Render additional attributes
+		renderStringAttributes(w, attrs)
+
+		// Close tag and continue
+		w.WriteByte('>')
+		return ast.WalkContinue, nil
+	}
+
+	// Render all icons dynamically
+	for _, icon := range getLinkIcons(n) {
+		w.WriteString("<span")
+		renderStringAttributes(w, []attr{
+			{"class", icon.class + " tooltip"},
+			{"data-tooltip-target", "info"},
+			{"data-tooltip", icon.tooltip},
+			{"title", icon.tooltip},
+		})
+		w.WriteByte('>')
+		w.WriteString(`<svg class="c-icon"><use href="#` + icon.iconID + `"></use></svg>`)
+		w.WriteString("</span>")
+	}
+
+	// Write closing tag <a>.
+	w.WriteString("</a>")
+
+	return ast.WalkContinue, nil
+}
+
+// linkExtension is a Goldmark extension that handles link rendering with special attributes
+// for external, internal, and same-package links.
+type linkExtension struct{}
+
+// ExtLinks instance for extending markdown with link functionality
+var ExtLinks = &linkExtension{}
+
+// Extend adds the LinkExtension to the provided Goldmark markdown processor
+func (l *linkExtension) Extend(m goldmark.Markdown) {
+	m.Parser().AddOptions(parser.WithASTTransformers(
+		util.Prioritized(&linkTransformer{}, 500),
+	))
+
+	// Register our renderer with a higher priority than the default renderer
+	m.Renderer().AddOptions(renderer.WithNodeRenderers(
+		util.Prioritized(&linkRenderer{}, 500),
+	))
+}
+
+// docLinks marks every link of a doc comment as user content. Doc comments
+// are the package author's, and the doc renderer is shared by pages of every
+// kind with no link policy of its own, so it treats each link as one from a
+// community document.
+type docLinks struct{}
+
+// ExtDocLinks adds rel="noopener nofollow ugc" to every link of a doc
+// comment.
+var ExtDocLinks goldmark.Extender = docLinks{}
+
+func (e docLinks) Extend(m goldmark.Markdown) {
+	m.Parser().AddOptions(parser.WithASTTransformers(util.Prioritized(e, 999)))
+}
+
+func (docLinks) Transform(doc *ast.Document, _ text.Reader, _ parser.Context) {
+	ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		switch n.(type) {
+		case *ast.Link, *ast.AutoLink:
+			if entering {
+				n.SetAttributeString("rel", []byte("noopener nofollow ugc"))
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+}

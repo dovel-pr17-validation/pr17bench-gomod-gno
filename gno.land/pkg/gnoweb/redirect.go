@@ -1,0 +1,36 @@
+package gnoweb
+
+import (
+	"net/http"
+
+	"github.com/gnolang/gno/gno.land/pkg/gnoweb/components"
+)
+
+// Redirects is a map of gnoweb paths that are redirected using RedirectMiddleware.
+var Redirects = map[string]string{
+	"/blog":            "/r/gnoland/blog",
+	"/gor":             "/contribute",
+	"/game-of-realms":  "/contribute",
+	"/grants":          "/partners",
+	"/language":        "/gnolang",
+	"/getting-started": "/start",
+}
+
+// RedirectMiddleware redirects all incoming requests whose path matches
+// any of the Redirects to the corresponding URL, and renders a redirect view.
+func RedirectMiddleware(next http.Handler, meta StaticMetadata) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check if the request path matches a redirect
+		if newPath, ok := Redirects[r.URL.Path]; ok {
+			http.Redirect(w, r, newPath, http.StatusFound)
+			components.RedirectView(components.RedirectData{
+				To:        newPath,
+				Analytics: meta.RedirectAnalytics(),
+			}).Render(w)
+			return
+		}
+
+		// Call the next handler
+		next.ServeHTTP(w, r)
+	})
+}

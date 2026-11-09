@@ -1,0 +1,311 @@
+# Gno networks
+
+## Network configurations
+
+| Network           | RPC Endpoint                            | Chain ID    | Deployment files                                                                                                           |
+|-------------------|-----------------------------------------|-------------|----------------------------------------------------------------------------------------------------------------------------|
+| Mainnet           | https://rpc.gno.land:443                | `gnoland-1` | [`misc/deployments/mainnet.gno.land`](https://github.com/gnolang/gno/tree/chain/mainnet/misc/deployments/mainnet.gno.land) |
+| Onyx / Test17     | https://rpc.onyx.testnets.gno.land:443  | `onyx-1`    | [`misc/deployments/onyx.gno.land`](https://github.com/gnolang/gno/tree/chain/mainnet/misc/deployments/onyx.gno.land)       |
+| Betanet (retired) | —                                       | `gnoland1`  | [`misc/deployments/gnoland1`](https://github.com/gnolang/gno/tree/chain/gnoland1/misc/deployments/gnoland1)                                                               |
+| Staging           | https://rpc.staging.gno.land:443        | `staging`   | [`misc/loop`](https://github.com/gnolang/gno/tree/master/misc/loop)                                                                                             |
+| Pearl / Test16 (retired) | — | `pearl-1` | [`misc/deployments/pearl.gno.land`](https://github.com/gnolang/gno/tree/chain/pearl/misc/deployments/pearl.gno.land)   |
+
+Mainnet (`gnoland-1`) launched at `2026-09-12T15:00:00Z` as a fresh chain — not
+a hardfork of betanet. Balances come from the audited
+[gnolang/independence-day](https://github.com/gnolang/independence-day)
+allocation, transfers start locked per Constitution §126, and there is **no
+faucet**. The `rpc.gno.land` endpoint serves `gnoland-1`; betanet, which held
+that name before, is retired. The version mainnet runs today, and every
+coordinated upgrade since launch, are listed in `UPGRADES.md` under
+[`misc/deployments/mainnet.gno.land/`](https://github.com/gnolang/gno/tree/chain/mainnet/misc/deployments/mainnet.gno.land).
+
+To watch mainnet live, [Gnockpit](https://gnockpit.gno.land/) shows its chain state, recent blocks, validators and peers, and [status.gno.land](https://status.gno.land/) reports service health, incidents and scheduled maintenance.
+
+Onyx (`onyx-1`) is the testnet on the mainnet line: it launched on
+`2026-09-28T00:00:00Z` running mainnet's code, and is upgraded whenever mainnet
+is: every mainnet release is rehearsed there first, as a release candidate on
+the commit mainnet's final is then cut from. It has a
+faucet and open transfers, mainnet's package set, namespaces and governance
+seed, and its own `UPGRADES.md` under
+[`misc/deployments/onyx.gno.land/`](https://github.com/gnolang/gno/tree/chain/mainnet/misc/deployments/onyx.gno.land).
+Pearl was retired in its favour.
+
+### WebSocket endpoints
+
+All networks follow the same pattern for websocket connections:
+
+```shell
+wss://<rpc-endpoint:port>/websocket
+```
+
+The endpoint serves the same request-response methods as HTTP. There is no
+event subscription — see [JSON-RPC endpoints](./rpc-endpoints.md).
+
+### Deployment files
+
+If you intend to [run a node](../builders/running-a-node.md) — a full node
+or a validator — the operational details you need are not in this page.
+They live with the network itself, under
+[`misc/deployments/`](../../misc/deployments)
+in the monorepo: one directory per network, holding its genesis (or the script that
+regenerates it) and a `README.md` / `VALIDATOR.md` with the join instructions
+and the node configuration; older networks also keep a `config.toml`.
+
+Two conventions to know:
+
+- A network's directory sits on that network's **`chain/<name>` branch**,
+  not on `master` — that's the branch the chain's release is cut from. A
+  testnet on the mainnet line (onyx) has no branch of its own: its directory
+  sits on `chain/mainnet`, and its `chain/<name>` launch tag marks the commit
+  that added its directory, on top of the mainnet version it launched on. The `master` copy is where the next
+  network is prepared, plus the archives of past ones.
+- The `chain/<name>` [release](https://github.com/gnolang/gno/releases)
+  carries the network's `genesis.json`, its `.gz` and their checksums. Binaries
+  and container images belong to version releases (`vX.Y.Z`): one per binary
+  the network has run, listed in that network's `UPGRADES.md`.
+
+Related infrastructure directories in the monorepo:
+
+| Directory | What it is |
+|-----------|------------|
+| [`misc/deployments`](../../misc/deployments) | Per-network genesis, config, and node/validator instructions |
+| [`misc/loop`](../../misc/loop) | Infrastructure running the Staging chain |
+| [`contribs/tx-archive`](../../contribs/tx-archive) | Archiving and replaying transaction history between networks |
+| [`gnolang/tx-exports`](https://github.com/gnolang/tx-exports) | Archived transaction data of past testnets |
+
+## Staging Environments
+
+Staging is an always-up-to-date staging testnet that allows for using
+the latest version of Gno, gno.land, and TM2. By utilizing the power of Docker
+& the [tx-archive](../../contribs/tx-archive) tool, the Staging
+can run the latest code from the master branch on the [Gno monorepo](https://github.com/gnolang/gno),
+while preserving most/all the previous transaction data.
+
+The Staging chain allows for quick iteration on the latest version of Gno - without
+having to make a hard/soft fork.
+
+Below is a diagram demonstrating how the Staging chain works:
+```
+                    +----------------------------------+
+                    |       Staging     running        |  < ----+
+                    +----------------------------------+        |
+                                     |                          |
+                                     |                          |
+                                     v                          |
+                    +----------------------------------+        |
+                    |   Detect changes in 'master'     |        |
+                    +----------------------------------+        |
+                                     |                          |
+                                     |                          |
+                                     v                          |
+                    +----------------------------------+        |
+                    | Archive transaction data & state |        |
+                    +----------------------------------+        |
+                                     |                          |
+                                     |                          |
+                                     v                          |
+                    +----------------------------------+        |
+                    |    Load changes from 'master'    |        |
+                    +----------------------------------+        |
+                                     |                          |
+                                     |                          |
+                                     v                          |
+                    +----------------------------------+        |
+                    |      Replay transaction data     |  ------+
+                    +----------------------------------+
+```
+
+Specifically, Staging behaves like a normal network until a change is detected
+in the `master` branch in the Gno monorepo. At this point, the Staging chain archives
+on-chain data using the [tx-archive](../../contribs/tx-archive)
+tool, saving all transactions that happened on it thus far.
+
+It then pulls the latest changes from the `master` branch, and inserts all
+previously archived transactions into the genesis of the newly deployed chain.
+After genesis has been replayed, the chain continues working as normal.
+
+### Using the Staging network
+
+The Staging network deployment can be found at [staging.gno.land](https://staging.gno.land), while
+the exposed RPC endpoints can be found on `https://rpc.staging.gno.land:443`.
+
+#### A warning note
+
+While allowing for quick iteration on the most up-to-date software, the Staging chain
+has some drawbacks:
+- If a breaking change happens on `master`, transactions that used the previous version of
+  Gno will fail to be replayed, meaning **data will be lost**.
+- Since transactions are archived and replayed during genesis,
+  block height & timestamp cannot be relied upon.
+
+#### Deploying to Staging
+
+There are two ways to deploy code to Staging:
+
+1. *automatic* - all packages in found in the `examples/gno.land/{p,r}/` directory in the [Gno monorepo](https://github.com/gnolang/gno) get added to the
+   new genesis each cycle,
+2. *permissionless* - this includes replayed transactions with `addpkg`, and
+   new transactions you can issue with `gnokey maketx addpkg`.
+
+Since the packages in `examples/gno.land/{p,r}` are deployed first,
+permissionless deployments get superseded when packages with identical `pkgpath`
+get merged into `examples/`.
+
+The above mechanism is also how the `examples/` on Staging get collaboratively
+iterated upon, which is its main mission.
+
+## Gno Testnets
+
+gno.land testnets are categorized by 4 main points:
+- **Persistence of state**
+  - Is the state and transaction history persisted?
+- **Timeliness of code**
+  - How up-to-date are Gno language features and demo packages & realms?
+- **Intended purpose**
+  - When should this testnet be used?
+- **Versioning strategy**
+  - How is this testnet versioned?
+
+Below you can find a breakdown of each existing testnet by these categories.
+
+### Staging chain
+
+The Staging chain is an always up-to-date rolling testnet. It is meant to be used as
+a nightly build of the Gno tech stack. The home page of [staging.gno.land](https://staging.gno.land)
+is the `gnoweb` render of the Staging testnet.
+
+- **Persistence of state:**
+  - State is kept on a best-effort basis
+  - Transactions that are affected by breaking changes will be discarded
+- **Timeliness of code:**
+  - Packages & realms which are available in the `examples/` folder on the
+    [Gno monorepo](https://github.com/gnolang/gno) exist on Staging in
+    matching state - they are refreshed with every new commit to the `master`
+    branch.
+- **Intended purpose**
+  - Providing access the latest version of Gno for fast development & demoing
+- **Versioning strategy**:
+  - Staging infrastructure is managed within the
+    [`misc/loop`](../../misc/loop) folder in the
+    monorepo
+
+### Onyx / Test17
+
+The current Gno.land testnet, launched on the 28th of September, 2026, and the one to use unless you have a reason not to. It runs mainnet's code, as the candidate of each mainnet release, and follows every mainnet upgrade, so what works here works on mainnet.
+
+- **Persistence of state:**
+  - State is fully persisted across coordinated upgrades, exactly as on mainnet:
+    every upgrade is rehearsed here before it reaches mainnet
+- **Timeliness of code:**
+  - The version onyx runs is the candidate of the version mainnet runs, on the
+    same commit; the launch version and
+    every upgrade since are in `UPGRADES.md` under
+    [`misc/deployments/onyx.gno.land`](https://github.com/gnolang/gno/tree/chain/mainnet/misc/deployments/onyx.gno.land)
+- **Intended purpose**
+  - Running a full node, testing validator coordination, deploying Gno dApps
+    against mainnet's code and package set with faucet funds and open transfers
+- **Versioning strategy:**
+  - No branch of its own: the [`chain/onyx`](https://github.com/gnolang/gno/releases/tag/chain%2Fonyx)
+    tag marks the mainnet commit it launched on; deployment files under
+    [`misc/deployments/onyx.gno.land`](https://github.com/gnolang/gno/tree/chain/mainnet/misc/deployments/onyx.gno.land)
+
+### Pearl / Test16 (retired)
+
+Released on the 26th of August, 2026; superseded by Onyx / Test17.
+
+- **Persistence of state:**
+  - State is fully persisted unless there are breaking changes in a new release,
+    where persistence partly depends on implementing a migration strategy
+- **Timeliness of code:**
+  - Pre-deployed packages and realms are at release tag [chain/pearl](https://github.com/gnolang/gno/releases/tag/chain%2Fpearl)
+- **Intended purpose**
+  - Running a full node, testing validator coordination, deploying stable Gno
+    dApps, creating tools that require persisted state & transaction history
+- **Versioning strategy:**
+  - Cut from the [`chain/pearl`](https://github.com/gnolang/gno/tree/chain/pearl)
+    branch; deployment files under
+    [`misc/deployments/pearl.gno.land`](https://github.com/gnolang/gno/tree/chain/pearl/misc/deployments/pearl.gno.land)
+
+### TestX
+
+These testnets are deprecated and currently serve as archives of previous progress.
+
+### Sapphire / Test15 (archive)
+
+Sapphire (Test15) was released on the 7th of August, 2026, and superseded by Pearl / Test16.
+
+### Topaz / Test14 (archive)
+
+Topaz (Test14) was released on the 17th of July, 2026, and superseded by Sapphire / Test15.
+
+### Test13 (archive)
+
+Test13 was released on the 15th of June, 2026, and superseded by Topaz / Test14.
+
+### Test12 (archive)
+
+Test12 is the testnet released on the 16th of April, 2026.
+
+### Test11 (archive)
+
+Test11 is the testnet released on the 12th of February, 2025.
+
+### Test10 (archive)
+
+Test10 is the testnet released on the 18th of December, 2025.
+
+### Test9 (archive)
+
+Test9 is the testnet released on the 14th of October, 2025.
+
+### Test8 (archive)
+
+Test8 is the testnet released on the 5th of September, 2025.
+
+### Test7 (archive)
+
+Test7 is the testnet released on the 25th of July, 2025.
+
+### Test6 (archive)
+
+Test6 enables token locking, implements the interrealm specification, GovDAO V3 and more.
+
+Launch date: 23rd of June 2025
+
+### Test5 (archive)
+
+Test5 a permanent multi-node testnet. It bumped the validator set from 7 to 17
+nodes, introduced GovDAO V2, and added lots of bug fixes and quality of life
+improvements. Archived data for test5 can be
+found [here](https://github.com/gnolang/tx-exports/tree/main/test5.gno.land).
+
+Test5 was launched in November 2024.
+
+## Test4 (archive)
+
+Test4 is the first permanent multi-node testnet. Archived data for test4 can be
+found [here](https://github.com/gnolang/tx-exports/tree/main/test4.gno.land).
+
+Launch date: July 10th 2024
+Release commit: [194903d](https://github.com/gnolang/gno/commit/194903db0350ace7d57910e6c34125d3aa9817da)
+
+### Test3 (archive)
+
+The third Gno testnet. Archived data for test3 can be found [here](https://github.com/gnolang/tx-exports/tree/main/test3.gno.land).
+
+Launch date: November 4th 2022
+Release commit: [1ca2d97](https://github.com/gnolang/gno/commit/1ca2d973817b174b5b06eb9da011e1fcd2cca575)
+
+### Test2 (archive)
+
+The second Gno testnet. Find archive data [here](https://github.com/gnolang/tx-exports/tree/main/test2.gno.land).
+
+Launch date: July 10th 2022
+Release commit: [652dc7a](https://github.com/gnolang/gno/commit/652dc7a3a62ee0438093d598d123a8c357bf2499)
+
+### Test1 (archive)
+
+The first Gno testnet. Find archive data [here](https://github.com/gnolang/tx-exports/tree/main/test1.gno.land).
+
+Launch date: May 6th 2022
+Release commit: [797c7a1](https://github.com/gnolang/gno/commit/797c7a132d65534df373c63b837cf94b7831ac6e)

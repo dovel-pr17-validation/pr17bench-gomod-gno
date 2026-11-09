@@ -1,0 +1,506 @@
+package http
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	types "github.com/gnolang/gno/tm2/pkg/bft/rpc/lib/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestClient_parseRemoteAddr(t *testing.T) {
+	t.Parallel()
+
+	testTable := []struct {
+		remoteAddr      string
+		expectedNetwork string
+		expectedRest    string
+	}{
+		{
+			"127.0.0.1",
+			"tcp",
+			"127.0.0.1:80",
+		},
+		{
+			"127.0.0.1:5000",
+			"tcp",
+			"127.0.0.1:5000",
+		},
+		{
+			"http://example.com",
+			"http",
+			"example.com:80",
+		},
+		{
+			"https://example.com",
+			"https",
+			"example.com:443",
+		},
+		{
+			"http://example.com:5000",
+			"http",
+			"example.com:5000",
+		},
+		{
+			"https://example.com:5000",
+			"https",
+			"example.com:5000",
+		},
+	}
+
+	for _, testCase := range testTable {
+		t.Run(testCase.remoteAddr, func(t *testing.T) {
+			t.Parallel()
+
+			n, r := parseRemoteAddr(testCase.remoteAddr)
+
+			assert.Equal(t, testCase.expectedNetwork, n)
+			assert.Equal(t, testCase.expectedRest, r)
+		})
+	}
+}
+
+// Following tests check that we correctly translate http/https to tcp,
+// and other protocols are left intact from parseRemoteAddr()
+
+func TestClient_makeHTTPDialer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("http", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := makeHTTPDialer("https://.")
+		require.Error(t, err)
+
+		assert.Contains(t, err.Error(), "dial tcp:", "should convert https to tcp")
+	})
+
+	t.Run("udp", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := makeHTTPDialer("udp://.")
+		require.Error(t, err)
+
+		assert.Contains(t, err.Error(), "dial udp:", "udp protocol should remain the same")
+	})
+}
+
+// createTestServer creates a test HTTP server
+func createTestServer(
+	t *testing.T,
+	handler http.Handler,
+) *httptest.Server {
+	t.Helper()
+
+	s := httptest.NewServer(handler)
+	t.Cleanup(s.Close)
+
+	return s
+}
+
+func TestClient_SendRequest(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid request, response", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			request = types.RPCRequest{
+				JSONRPC: "2.0",
+				ID:      types.JSONRPCStringID("id"),
+			}
+
+			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, http.MethodPost, r.Method)
+				require.Equal(t, "application/json", r.Header.Get("content-type"))
+
+				// Parse the message
+				var req types.RPCRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				require.Equal(t, request.ID.String(), req.ID.String())
+
+				// Send an empty response back
+				response := types.RPCResponse{
+					JSONRPC: "2.0",
+					ID:      req.ID,
+				}
+
+				// Marshal the response
+				marshalledResponse, err := json.Marshal(response)
+				require.NoError(t, err)
+
+				_, err = w.Write(marshalledResponse)
+				require.NoError(t, err)
+			})
+
+			server = createTestServer(t, handler)
+		)
+
+		// Create the client
+		c, err := NewClient(server.URL)
+		require.NoError(t, err)
+
+		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancelFn()
+
+		// Send the request
+		resp, err := c.SendRequest(ctx, request)
+		require.NoError(t, err)
+
+		assert.Equal(t, request.ID, resp.ID)
+		assert.Equal(t, request.JSONRPC, resp.JSONRPC)
+		assert.Nil(t, resp.Result)
+		assert.Nil(t, resp.Error)
+	})
+
+	t.Run("response ID mismatch", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			request = types.RPCRequest{
+				JSONRPC: "2.0",
+				ID:      types.JSONRPCStringID("id"),
+			}
+
+			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, http.MethodPost, r.Method)
+				require.Equal(t, "application/json", r.Header.Get("content-type"))
+
+				// Send an empty response back,
+				// with an invalid ID
+				response := types.RPCResponse{
+					JSONRPC: "2.0",
+					ID:      types.JSONRPCStringID("totally random ID"),
+				}
+
+				// Marshal the response
+				marshalledResponse, err := json.Marshal(response)
+				require.NoError(t, err)
+
+				_, err = w.Write(marshalledResponse)
+				require.NoError(t, err)
+			})
+
+			server = createTestServer(t, handler)
+		)
+
+		// Create the client
+		c, err := NewClient(server.URL)
+		require.NoError(t, err)
+
+		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancelFn()
+
+		// Send the request
+		resp, err := c.SendRequest(ctx, request)
+		assert.Nil(t, resp)
+		assert.ErrorIs(t, err, ErrRequestResponseIDMismatch)
+	})
+
+	t.Run("body too large returns server error", func(t *testing.T) {
+		t.Parallel()
+
+		const maxBodyBytes = 1024
+
+		// Mimic the real RPC server: apply MaxBytesReader, then
+		// attempt to read the body like makeJSONRPCHandler does.
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+			_, err := io.ReadAll(r.Body)
+			if err != nil {
+				resp := types.RPCInvalidRequestError(
+					types.JSONRPCStringID(""),
+					err,
+				)
+
+				data, marshalErr := json.Marshal(resp)
+				require.NoError(t, marshalErr)
+
+				_, writeErr := w.Write(data)
+				require.NoError(t, writeErr)
+
+				return
+			}
+		})
+
+		server := createTestServer(t, handler)
+
+		c, err := NewClient(server.URL)
+		require.NoError(t, err)
+
+		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancelFn()
+
+		request := types.RPCRequest{
+			JSONRPC: "2.0",
+			ID:      types.JSONRPCStringID("id"),
+			Method:  "test",
+			Params:  json.RawMessage(`"` + strings.Repeat("x", maxBodyBytes+1) + `"`),
+		}
+
+		resp, err := c.SendRequest(ctx, request)
+		assert.Nil(t, resp)
+		require.Error(t, err)
+
+		assert.NotErrorIs(t, err, ErrRequestResponseIDMismatch)
+
+		var rpcErr *types.RPCError
+		require.ErrorAs(t, err, &rpcErr)
+		assert.Equal(t, -32600, rpcErr.Code)
+	})
+}
+
+func TestClient_SendBatchRequest(t *testing.T) {
+	t.Parallel()
+
+	var (
+		request = types.RPCRequest{
+			JSONRPC: "2.0",
+			ID:      types.JSONRPCStringID("id"),
+		}
+
+		requests = types.RPCRequests{
+			request,
+			request,
+		}
+
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, http.MethodPost, r.Method)
+			require.Equal(t, "application/json", r.Header.Get("content-type"))
+
+			// Parse the message
+			var reqs types.RPCRequests
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&reqs))
+			require.Len(t, reqs, len(requests))
+
+			for _, req := range reqs {
+				require.Equal(t, request.ID.String(), req.ID.String())
+			}
+
+			// Send an empty response batch back
+			response := types.RPCResponse{
+				JSONRPC: "2.0",
+				ID:      request.ID,
+			}
+
+			responses := types.RPCResponses{
+				response,
+				response,
+			}
+
+			// Marshal the responses
+			marshalledResponses, err := json.Marshal(responses)
+			require.NoError(t, err)
+
+			_, err = w.Write(marshalledResponses)
+			require.NoError(t, err)
+		})
+
+		server = createTestServer(t, handler)
+	)
+
+	// Create the client
+	c, err := NewClient(server.URL)
+	require.NoError(t, err)
+
+	ctx, cancelFn := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancelFn()
+
+	// Send the request
+	resps, err := c.SendBatch(ctx, requests)
+	require.NoError(t, err)
+
+	require.Len(t, resps, len(requests))
+
+	for _, resp := range resps {
+		assert.Equal(t, request.ID, resp.ID)
+		assert.Equal(t, request.JSONRPC, resp.JSONRPC)
+		assert.Nil(t, resp.Result)
+		assert.Nil(t, resp.Error)
+	}
+}
+
+// TestClient_toClientAddress_preservesPath covers serving an RPC behind a URL
+// prefix, which is how a chain and its web UI share one hostname and one
+// certificate. The "/" to "." encoding exists for unix sockets, whose address
+// is a filesystem path and so gives the request URL no host; applying it to a
+// tcp/http address turned "http://host:26657/rpc" into "http://host:26657.rpc",
+// which does not parse.
+func TestClient_toClientAddress_preservesPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       string
+	}{
+		{"http with a path", "http://127.0.0.1:26657/rpc", "http://127.0.0.1:26657/rpc"},
+		{"https with a path", "https://gno.example/rpc", "https://gno.example:443/rpc"},
+		{"http with a nested path", "http://127.0.0.1:8888/gno/rpc", "http://127.0.0.1:8888/gno/rpc"},
+		{"plain host is unchanged", "http://127.0.0.1:26657", "http://127.0.0.1:26657"},
+		{"tcp is unchanged", "tcp://127.0.0.1:26657", "http://127.0.0.1:26657"},
+		// A unix socket still gets its path encoded into the hostname, only
+		// so the URL has a host; makeHTTPDialer dials the raw remote.
+		{"unix socket keeps the encoding", "unix:///var/run/gno.sock", "http://.var.run.gno.sock"},
+		{"unixpacket socket keeps the encoding", "unixpacket:///tmp/node.sock", "http://.tmp.node.sock"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := toClientAddress(tt.remoteAddr)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestClient_makeHTTPDialer_stripsPath: a URL path belongs to the request, not
+// to the dial target. net.Dial("tcp", "127.0.0.1:26657/rpc") reads "/rpc" as
+// the port and fails with "unknown port".
+func TestClient_makeHTTPDialer_stripsPath(t *testing.T) {
+	t.Parallel()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(ts.Close)
+
+	// ts.URL is http://127.0.0.1:PORT; dialing it with a path must still reach
+	// the listener rather than treating the path as part of the address.
+	conn, err := makeHTTPDialer(ts.URL + "/rpc")
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.NoError(t, conn.Close())
+}
+
+// TestClient_makeHTTPDialer_stripsPathFamilies: tcp4 and tcp6 are dialed as
+// tcp, so they need the same strip; without it "tcp4://127.0.0.1:26657/rpc"
+// fails with "lookup tcp4/26657/rpc: unknown port".
+func TestClient_makeHTTPDialer_stripsPathFamilies(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		network string
+		addr    string
+	}{
+		{"tcp", "127.0.0.1:0"},
+		{"tcp4", "127.0.0.1:0"},
+		{"tcp6", "[::1]:0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.network, func(t *testing.T) {
+			t.Parallel()
+
+			ln, err := net.Listen(tt.network, tt.addr)
+			if err != nil {
+				t.Skipf("cannot listen on %s: %v", tt.network, err)
+			}
+			t.Cleanup(func() { ln.Close() })
+
+			conn, err := makeHTTPDialer(tt.network + "://" + ln.Addr().String() + "/rpc")
+			require.NoError(t, err)
+			require.NoError(t, conn.Close())
+		})
+	}
+}
+
+// TestClient_unixSocket sends a request end to end over each unix socket
+// family the server's Listen accepts.
+func TestClient_unixSocket(t *testing.T) {
+	t.Parallel()
+
+	for _, network := range []string{"unix", "unixpacket"} {
+		t.Run(network, func(t *testing.T) {
+			t.Parallel()
+
+			// t.TempDir can exceed the ~104 byte sun_path limit on macOS.
+			dir, err := os.MkdirTemp("", "rpc")
+			require.NoError(t, err)
+			t.Cleanup(func() { os.RemoveAll(dir) })
+			sock := filepath.Join(dir, "node.sock")
+
+			ln, err := net.Listen(network, sock)
+			if err != nil {
+				t.Skipf("cannot listen on %s: %v", network, err)
+			}
+
+			request := types.RPCRequest{JSONRPC: "2.0", ID: types.JSONRPCIntID(1)}
+			srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				assert.NoError(t, json.NewEncoder(w).Encode(types.RPCResponse{JSONRPC: "2.0", ID: request.ID}))
+			})}
+			go srv.Serve(ln)
+			t.Cleanup(func() { srv.Close() })
+
+			c, err := NewClient(network + "://" + sock)
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			resp, err := c.SendRequest(ctx, request)
+			require.NoError(t, err)
+			assert.Equal(t, request.ID, resp.ID)
+		})
+	}
+}
+
+// TestClient_toClientAddress_schemes covers each scheme family, and that a
+// remote with no host is rejected rather than sent to localhost:80.
+func TestClient_toClientAddress_schemes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       string
+		wantErr    bool
+	}{
+		{"tcp", "tcp://127.0.0.1:26657/rpc", "http://127.0.0.1:26657/rpc", false},
+		{"tcp4", "tcp4://127.0.0.1:26657/rpc", "http://127.0.0.1:26657/rpc", false},
+		{"tcp6", "tcp6://[::1]:26657/rpc", "http://[::1]:26657/rpc", false},
+		{"unix", "unix:///var/run/gno.sock", "http://.var.run.gno.sock", false},
+		{"unixpacket", "unixpacket:///var/run/gno.sock", "http://.var.run.gno.sock", false},
+		{"scheme-less host", "127.0.0.1:26657", "http://127.0.0.1:26657", false},
+		{"scheme-less port only", ":26657", "http://:26657", false},
+		{"scheme-less path", "/var/run/gno.sock", "", true},
+		{"http without host", "http:///rpc", "", true},
+		{"https without host", "https://", "", true},
+		{"tcp without host", "tcp:///rpc", "", true},
+		{"tcp4 without host", "tcp4:///rpc", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := toClientAddress(tt.remoteAddr)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestClient_NewClient_noHost(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewClient("/var/run/gno.sock")
+	require.ErrorContains(t, err, "invalid RPC URL")
+}
